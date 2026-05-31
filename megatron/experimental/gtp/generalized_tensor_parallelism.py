@@ -715,9 +715,25 @@ class GTPShardedParam(torch.nn.Parameter):
                     continue
 
                 weight._quantizer = _configure_quantizer(quantizer, weight.group)
-                # This init quantize is the only allocation of the quantized storage
-                # (re-quantize writes in place), so route it via _graphed_alloc.
-                with _graphed_alloc(getattr(weight, "chain_id", GTPChain.UNGRAPHED.value)):
+                # Symm-eligible quantized weights (the FP8/MXFP8/NVFP4 AG input, all
+                # sub-buffers) go into the per-group ncclMemAlloc pool so NCCL selects
+                # symmetric kernels for the quantized weight AG.  ncclMemAlloc segments
+                # are CG-replay-stable so this covers both UNGRAPHED and GRAPHED chains
+                # without a separate reallocate_to_mempool step.  Non-symm GRAPHED
+                # weights fall back to _graphed_alloc for CG-pool stability.
+                _q_group = weight.group
+                _q_symm = (
+                    _q_group is not None
+                    and _q_group.size() > 1
+                    and gtp_symm_eligible(is_expert=getattr(weight, "is_routed_expert", False))
+                )
+                if _q_symm:
+                    _q_alloc_ctx = gtp_mem_pool_ctx(_q_group)
+                else:
+                    _q_alloc_ctx = _graphed_alloc(
+                        getattr(weight, "chain_id", GTPChain.UNGRAPHED.value)
+                    )
+                with _q_alloc_ctx:
                     weight.quantized = weight._quantizer.quantize(weight.get_padded_shard())
                 weight.quantized.is_routed_expert = getattr(weight, "is_routed_expert", False)
                 # fp8_param_gather: the init quantize above already produced a

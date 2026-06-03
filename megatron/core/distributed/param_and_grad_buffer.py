@@ -1300,12 +1300,26 @@ class _ParamAndGradBuffer:
         # selects symmetric kernels for the BF16 weight AG (input is param.data,
         # a view into param_data) and the grad-shard RS output.
         if self.nccl_ub and self.nccl_mem_pool is not None:
+            # Gate GTP/EGTP-group registration on the symm flags: ENABLE_GTP_SYMM
+            # (dense) / ENABLE_EGTP_SYMM (expert). When a gate is off, the
+            # --nccl-ub pool is NOT registered on that group -- it stays
+            # registered on the DP group only (the upstream --nccl-ub behavior).
+            # This keeps the bf16 param_data/grad_data GTP registration consistent
+            # with the rest of the GTP symm port instead of activating purely on
+            # --nccl-ub.
+            from megatron.experimental.gtp.symm_pool import gtp_symm_eligible
+
             gtp_groups = {}
             for param in self.params:
-                if getattr(param, "is_gtp", False):
-                    group = getattr(param, "group", None)
-                    if group is not None and group.size() > 1:
-                        gtp_groups.setdefault(group.group_name, group)
+                if not getattr(param, "is_gtp", False):
+                    continue
+                if not gtp_symm_eligible(
+                    is_expert=getattr(param, "is_routed_expert", False)
+                ):
+                    continue
+                group = getattr(param, "group", None)
+                if group is not None and group.size() > 1:
+                    gtp_groups.setdefault(group.group_name, group)
             if gtp_groups:
                 symmetric = not self.ddp_config.disable_symmetric_registration
                 warmup = torch.zeros(1, device=torch.cuda.current_device())

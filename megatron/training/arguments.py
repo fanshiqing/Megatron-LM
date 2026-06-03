@@ -2862,6 +2862,10 @@ def _add_distributed_args(parser):
     group.add_argument('--disable-symmetric-registration', action='store_true', dest='disable_symmetric_registration',
                        default=False, help='Disable symmetric (window) registration for NCCL userbuffer registration.'
                        'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.')
+    group.add_argument('--disable-ddp-registration', action='store_true', dest='disable_ddp_registration',
+                       default=False, help='With --use-nccl-ub, allocate param_data/grad_data in the ncclMemAlloc pool '
+                       '(and remap params into it) but do NOT ncclCommRegister it on the DP group -- pooled allocation '
+                       'with zero registration. Diagnostic.')
     group.add_argument('--fsdp-manual-registration', action='store_true', dest='fsdp_manual_registration',
                        default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
                        'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')

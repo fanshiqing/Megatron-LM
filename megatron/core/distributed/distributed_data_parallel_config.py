@@ -167,8 +167,15 @@ class DistributedDataParallelConfig:
 
     disable_symmetric_registration: bool = False
     """If true, disable symmetric (window) registration for NCCL userbuffer registration.
-      This option will force to use conventional (local) userbuffer registration 
+      This option will force to use conventional (local) userbuffer registration
       when nccl_ub is set.
+    """
+
+    disable_ddp_registration: bool = False
+    """If true and nccl_ub is set, allocate param_data/grad_data in the ncclMemAlloc
+      pool (and remap params into it) but perform NO ncclCommRegister on the DP group --
+      i.e. pooled allocation with zero registration. Diagnostic knob to isolate the
+      effect of the pooled allocation itself from buffer registration.
     """
 
     fsdp_manual_registration: bool = False

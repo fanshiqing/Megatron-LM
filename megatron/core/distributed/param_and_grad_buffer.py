@@ -1286,6 +1286,46 @@ class _ParamAndGradBuffer:
             dp_cp_group=self.dp_cp_group,
         )
 
+        # GTP symmetric-memory registration (reuses the --nccl-ub pool).
+        #
+        # The nccl_ub block above allocated param_data/grad_data in
+        # self.nccl_mem_pool and registered that pool on this buffer's DP
+        # reduction group only. But the GTP weight all-gather and wgrad
+        # reduce-scatter run on each param's GTP group (param.group), not the DP
+        # group. So additionally register the SAME pool on every distinct GTP
+        # group present in this buffer. Registration is per-communicator, so
+        # this is a fresh registration on the GTP comm (not a re-registration of
+        # the DP comm) -- register-once, never deregister. PyTorch's segment
+        # hook then keeps param_data/grad_data window-registered there, and NCCL
+        # selects symmetric kernels for the BF16 weight AG (input is param.data,
+        # a view into param_data) and the grad-shard RS output.
+        if self.nccl_ub and self.nccl_mem_pool is not None:
+            gtp_groups = {}
+            for param in self.params:
+                if getattr(param, "is_gtp", False):
+                    group = getattr(param, "group", None)
+                    if group is not None and group.size() > 1:
+                        gtp_groups.setdefault(group.group_name, group)
+            if gtp_groups:
+                symmetric = not self.ddp_config.disable_symmetric_registration
+                warmup = torch.zeros(1, device=torch.cuda.current_device())
+                # Sorted iteration is load-bearing: the registration order must
+                # match across ranks to avoid a cross-group deadlock in NCCL's
+                # register path.
+                for group_name, group in sorted(gtp_groups.items()):
+                    # Warm the group's comm so register_mem_pool sees an
+                    # initialized communicator (created lazily on first use).
+                    torch.distributed.all_reduce(warmup, group=group)
+                    nccl_allocator.register_mem_pool(
+                        self.nccl_mem_pool, group, symmetric=symmetric
+                    )
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        f"[MCORE][GTP] Registered --nccl-ub pool on GTP group "
+                        f"{group_name} (size={group.size()}, symmetric={symmetric})",
+                    )
+
     def _compute_nvfp4_packed_layout(self, params_with_names):
         """Derive packed NVFP4 index map and bucket indices from the primary layout.
 

@@ -1203,6 +1203,17 @@ def local_multi_tensor_scale(chunk_size, noop_flag, tensor_lists, scale):
         dst.copy_(src * scale)
 
 
+# works as a drop-in replacement for transformer_engine's multi_tensor_count_nonzero
+def local_multi_tensor_count_nonzero(chunk_size, noop_flag, tensor_lists, *args):
+    """Counts nonzero elements across a list of contiguous tensors.
+
+    Works as a drop-in replacement for the fused multi_tensor_count_nonzero kernel; returns
+    the total nonzero count across ``tensor_lists[0]`` as a single-element int64 CUDA tensor.
+    """
+    total = sum(int(torch.count_nonzero(tensor)) for tensor in tensor_lists[0])
+    return torch.tensor([total], dtype=torch.int64, device="cuda")
+
+
 class _ValueWithRank:
     """This is an internal class, not for use outside this module
 

@@ -2,10 +2,13 @@
 
 """Gradient clipping."""
 
+import os
 from typing import List, Optional, Union
 
 import torch
 from torch import inf
+
+from megatron.core.utils import local_multi_tensor_count_nonzero
 
 try:
     from transformer_engine.pytorch.optimizers import (
@@ -18,6 +21,15 @@ try:
     l2_norm_impl = multi_tensor_l2norm
     multi_tensor_scale_impl = multi_tensor_scale
     multi_tensor_scale_tensor_impl = multi_tensor_scale_tensor
+
+    try:
+        # Available only in recent Transformer Engine builds; fall back to the local
+        # implementation against older pinned revisions that lack the fused count kernel.
+        from transformer_engine.pytorch.optimizers import multi_tensor_count_nonzero
+
+        count_nonzero_impl = multi_tensor_count_nonzero
+    except ImportError:
+        count_nonzero_impl = local_multi_tensor_count_nonzero
 except ImportError:
     try:
         import amp_C
@@ -26,6 +38,8 @@ except ImportError:
         l2_norm_impl = amp_C.multi_tensor_l2norm
         multi_tensor_scale_impl = amp_C.multi_tensor_scale
         multi_tensor_scale_tensor_impl = None
+        # Apex has no fused count kernel; use the local implementation.
+        count_nonzero_impl = local_multi_tensor_count_nonzero
     except ImportError:
         import warnings
 
@@ -45,6 +59,13 @@ except ImportError:
         l2_norm_impl = local_multi_tensor_l2_norm
         multi_tensor_scale_impl = local_multi_tensor_scale
         multi_tensor_scale_tensor_impl = None
+        count_nonzero_impl = local_multi_tensor_count_nonzero
+
+
+# Allow forcing the local (non-fused) zero count via env var, e.g. for A/B benchmarking or to
+# bypass the fused kernel. Defaults to the fused multi-tensor kernel when it is available.
+if os.getenv("MEGATRON_USE_FUSED_COUNT_NONZERO", "1").lower() in ("0", "false", "no", "off"):
+    count_nonzero_impl = local_multi_tensor_count_nonzero
 
 
 from .. import parallel_state
@@ -238,7 +259,13 @@ def count_zeros_fp32(
     #   - parameter should not be shared
     #   - should not be a replica due to tensor model parallelism
     #   - should not be a GTP duplicate (non-GTP params identical across GTP peers)
-    total_num_zeros = torch.zeros(1, dtype=torch.int64, device='cuda')
+    # Collect the eligible local gradient tensors (and their total size) in a single pass, so
+    # the zero count can be computed with one fused multi-tensor kernel instead of a
+    # count_nonzero launch per parameter. Zero-element grads (e.g. an empty Megatron FSDP shard)
+    # are skipped: they contribute no zeros, and a trailing zero-chunk tensor would make the
+    # fused kernel drop the pending counts for the rest of the batch.
+    grads = []
+    total_numel = 0
     data_parallel_group = None
     use_megatron_fsdp = False
     gtp_rank = parallel_state.get_generalized_tensor_parallel_remat_rank()
@@ -248,8 +275,9 @@ def count_zeros_fp32(
             # If the parameter is managed by Megatron FSDP, we need to handle it differently.
             use_megatron_fsdp = True
             grad = param.grad._local_tensor
-            num_zeros = grad.numel() - torch.count_nonzero(grad)
-            total_num_zeros += num_zeros
+            if grad.numel() > 0:
+                grads.append(grad)
+                total_numel += grad.numel()
             continue
 
         grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"
@@ -276,14 +304,24 @@ def count_zeros_fp32(
             grad_obj = getattr(param, grad_attr)
             data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)
             grad = to_local_if_dtensor(grad_obj).detach()
-            num_zeros = grad.numel() - torch.count_nonzero(grad)
-            total_num_zeros = num_zeros + total_num_zeros
+            if grad.numel() > 0:
+                grads.append(grad)
+                total_numel += grad.numel()
 
     if use_megatron_fsdp and data_parallel_group is not None:
         raise ValueError(
             "Unexpected use of Megatron FSDP with data parallel group. "
             "Please ensure that the parameters are properly managed by Megatron FSDP."
         )
+
+    # Count zeros across all eligible grads with a single fused multi-tensor kernel
+    # (num_zeros = total elements - total nonzero elements).
+    if grads:
+        dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
+        num_nonzeros = multi_tensor_applier(count_nonzero_impl, dummy_overflow_buf, [grads])
+        total_num_zeros = (total_numel - num_nonzeros.to(torch.int64)).reshape(1)
+    else:
+        total_num_zeros = torch.zeros(1, dtype=torch.int64, device='cuda')
 
     # Sum across all data-parallel GPUs if using FSDP.
     if data_parallel_group:

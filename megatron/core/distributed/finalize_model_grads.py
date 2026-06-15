@@ -30,6 +30,16 @@ from ..utils import (
     get_tensor_model_parallel_group_if_none,
 )
 
+try:
+    from transformer_engine.pytorch.utils import nvtx_range_pop, nvtx_range_push
+except (ImportError, ModuleNotFoundError):
+
+    def nvtx_range_push(msg=None):  # type: ignore[misc]
+        pass
+
+    def nvtx_range_pop(msg=None):  # type: ignore[misc]
+        pass
+
 
 def _get_main_grad_attr(param: torch.nn.Parameter):
     if hasattr(param, "main_grad"):
@@ -449,6 +459,7 @@ def _allreduce_replicated_grads_over_gtp_group(model: List[torch.nn.Module]):
     leaving them 1/gtp short. SUM (not AVG) over the gtp/egtp group recovers the full mean.
     No-op when GTP is inactive (gtp/egtp group size <= 1).
     """
+    nvtx_range_push("allreduce_replicated_grads_over_gtp")
     gtp_group = parallel_state.get_generalized_tensor_parallel_remat_group(check_initialized=False)
     egtp_group = parallel_state.get_expert_generalized_tensor_parallel_remat_group(
         check_initialized=False
@@ -485,6 +496,7 @@ def _allreduce_replicated_grads_over_gtp_group(model: List[torch.nn.Module]):
             grad_attr = _get_main_grad_attr(param)
             orig_grad = getattr(param, grad_attr)
             setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
+    nvtx_range_pop()
 
 
 def finalize_model_grads(

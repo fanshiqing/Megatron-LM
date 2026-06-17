@@ -1476,18 +1476,29 @@ def validate_args(args, defaults={}):
             "--dist-ckpt-optim-fully-reshardable)."
         )
 
-        # Propagate --fp8-param-gather into GTPConfig: enables optimizer-side
-        # FP32->FP8 cast for GTP shards, so the forward skips BF16->FP8.
-        if getattr(args, 'fp8_param_gather', False):
+        # Propagate GTP-related args into the global GTPConfig:
+        #  - fp8_param_gather: optimizer-side FP32->FP8 cast for GTP shards, so the
+        #    forward skips BF16->FP8.
+        #  - gtp_nccl_ub / egtp_nccl_ub: gate GTP (dense) / EGTP (expert)
+        #    symmetric-memory registration of the DDP param buffer, independent of
+        #    --use-nccl-ub.
+        if (getattr(args, 'fp8_param_gather', False)
+                or getattr(args, 'gtp_nccl_ub', False)
+                or getattr(args, 'egtp_nccl_ub', False)):
             from megatron.experimental.gtp import update_gtp_config
 
-            update_gtp_config(fp8_param_gather=True)
-            warn_rank_0(
-                "GTP + --fp8-param-gather: setting "
-                "GTPConfig.fp8_param_gather=True (optimizer step "
-                "pre-quantizes GTP shards, skipping the per-forward "
-                "BF16->FP8 cast)."
+            update_gtp_config(
+                fp8_param_gather=getattr(args, 'fp8_param_gather', False),
+                gtp_nccl_ub=getattr(args, 'gtp_nccl_ub', False),
+                egtp_nccl_ub=getattr(args, 'egtp_nccl_ub', False),
             )
+            if getattr(args, 'fp8_param_gather', False):
+                warn_rank_0(
+                    "GTP + --fp8-param-gather: setting "
+                    "GTPConfig.fp8_param_gather=True (optimizer step "
+                    "pre-quantizes GTP shards, skipping the per-forward "
+                    "BF16->FP8 cast)."
+                )
 
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:
@@ -2862,10 +2873,15 @@ def _add_distributed_args(parser):
     group.add_argument('--disable-symmetric-registration', action='store_true', dest='disable_symmetric_registration',
                        default=False, help='Disable symmetric (window) registration for NCCL userbuffer registration.'
                        'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.')
-    group.add_argument('--disable-ddp-registration', action='store_true', dest='disable_ddp_registration',
-                       default=False, help='With --use-nccl-ub, allocate param_data/grad_data in the ncclMemAlloc pool '
-                       '(and remap params into it) but do NOT ncclCommRegister it on the DP group -- pooled allocation '
-                       'with zero registration. Diagnostic.')
+    group.add_argument('--gtp-nccl-ub', action='store_true', dest='gtp_nccl_ub',
+                       default=False, help='Enable GTP symmetric memory for dense (non-expert) GTP params, independent of '
+                       '--use-nccl-ub. Always activates the GTP per-group symm pool (fp8 AG input, AG output, '
+                       'reduce-scatter buffers). Additionally, when --use-distributed-optimizer is set (so the DDP '
+                       'param buffer param_data -- the BF16 AG input -- exists), backs param_data with an ncclMemAlloc '
+                       'pool and registers it on the GTP group(s) only (not the DP group unless --use-nccl-ub). Without '
+                       'the distributed optimizer there is no param_data to register, so only the GTP per-group pool applies.')
+    group.add_argument('--egtp-nccl-ub', action='store_true', dest='egtp_nccl_ub',
+                       default=False, help='Like --gtp-nccl-ub but for routed-expert (EGTP) GTP groups. Off by default.')
     group.add_argument('--fsdp-manual-registration', action='store_true', dest='fsdp_manual_registration',
                        default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
                        'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')

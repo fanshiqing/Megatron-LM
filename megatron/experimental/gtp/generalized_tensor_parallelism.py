@@ -27,7 +27,6 @@ _GTP_TE_MIN_VERSION = Version("2.17")
 from megatron.experimental.gtp.symm_pool import (
     RegisteredLifoPool,
     gtp_mem_pool_ctx,
-    gtp_symm_eligible,
     register_gtp_pool,
 )
 
@@ -338,6 +337,13 @@ class GTPConfig:
     # directly into GTPShardedParam.quantized; forward's _quantize_if_needed
     # short-circuits to the cached FP8. Moves BF16->FP8 off the fwd critical path.
     fp8_param_gather: bool = False
+    # GTP symmetric-memory gates (set from --gtp-nccl-ub / --egtp-nccl-ub). When on,
+    # GTP stamps the per-param `gtp_smr` / `param_needs_nccl_mem` attributes at wrap
+    # time (see _gtp_attach_attrs for what each drives). Independent of --use-nccl-ub.
+    #   gtp_nccl_ub:  dense (non-expert) GTP params.
+    #   egtp_nccl_ub: routed-expert (EGTP) params.
+    gtp_nccl_ub: bool = False
+    egtp_nccl_ub: bool = False
     # Stub field, reserved for a follow-up MR that will re-land the coalesced
     # NVFP4 amax allreduce across the GTP group (single NCCL call across all
     # batched per-expert amax tensors, plus the TE split-phase compute_amax /
@@ -434,6 +440,14 @@ def _gtp_attach_attrs(gtp_shard, gtp_group, *, is_grouped=False, expert_idx=0):
         gtp_shard.chain_id = GTPChain.UNGRAPHED.value
     gtp_shard.group = gtp_group
     gtp_shard.gtp_size = gtp_group.size()
+    # Two per-param symmetric-memory gates (dense vs expert via is_grouped):
+    #  - gtp_smr: use the GTP per-group symm pool (fp8 AG input/output, RS bufs);
+    #    read only within GTP.
+    #  - param_needs_nccl_mem: core should pool param_data (BF16 AG input); applied
+    #    only under the distributed optimizer (see param_and_grad_buffer trigger).
+    symm = GTP_CONFIG.egtp_nccl_ub if is_grouped else GTP_CONFIG.gtp_nccl_ub
+    gtp_shard.gtp_smr = symm
+    gtp_shard.param_needs_nccl_mem = symm
     global _GTP_PARAMS
     _GTP_PARAMS.append(gtp_shard)
 
@@ -452,9 +466,9 @@ def wrap_module_params_gtp(module, weight_names, gtp_group, is_grouped=None):
 
     # Register this group's symmetric-memory pool once. This issues a collective
     # (comm warmup), so it must run here at construction time -- not lazily during
-    # CUDA-graph capture or forward. Gated per class: ENABLE_GTP_SYMM (dense) /
-    # ENABLE_EGTP_SYMM (expert). Idempotent across modules sharing a group.
-    if gtp_symm_eligible(is_expert=bool(is_grouped)):
+    # CUDA-graph capture or forward. Gated per class by GTPConfig.gtp_nccl_ub
+    # (dense) / .egtp_nccl_ub (expert). Idempotent across modules sharing a group.
+    if (GTP_CONFIG.egtp_nccl_ub if is_grouped else GTP_CONFIG.gtp_nccl_ub):
         register_gtp_pool(gtp_group)
 
     for idx, name in enumerate(weight_names):
@@ -725,7 +739,7 @@ class GTPShardedParam(torch.nn.Parameter):
                 _q_symm = (
                     _q_group is not None
                     and _q_group.size() > 1
-                    and gtp_symm_eligible(is_expert=getattr(weight, "is_routed_expert", False))
+                    and getattr(weight, "gtp_smr", False)
                 )
                 if _q_symm:
                     _q_alloc_ctx = gtp_mem_pool_ctx(_q_group)
@@ -1294,7 +1308,7 @@ class GTPShardedParam(torch.nn.Parameter):
         return (
             self.group is not None
             and self.group.size() > 1
-            and gtp_symm_eligible(is_expert=self.is_routed_expert)
+            and getattr(self, "gtp_smr", False)
         )
 
     def get_wgrad_tensor(self):
@@ -1685,12 +1699,12 @@ class GTPWeightCache:
         # address-stable across graph replays, so no separate CG-mempool routing is
         # needed for symm buffers.  Non-symm GRAPHED buffers fall back to
         # _graphed_alloc (routes into _CG_MEMPOOL for replay stability).
-        # Gated by ENABLE_GTP_SYMM / ENABLE_EGTP_SYMM.
+        # Gated per-param by the stamped gtp_smr attribute.
         group = getattr(param, "group", None)
         if (
             group is not None
             and group.size() > 1
-            and gtp_symm_eligible(is_expert=getattr(param, "is_routed_expert", False))
+            and getattr(param, "gtp_smr", False)
         ):
             alloc_ctx = gtp_mem_pool_ctx(group)
         else:

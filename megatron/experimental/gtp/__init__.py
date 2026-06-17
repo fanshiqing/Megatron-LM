@@ -31,6 +31,10 @@ try:
         wait_gtp_grads_on_current_stream,
         wrap_module_params_gtp,
     )
+    from megatron.experimental.gtp.symm_pool import (
+        deregister_gtp_buffers_symm,
+        register_gtp_buffers_symm,
+    )
 
     HAVE_GTP = True
 except ImportError:
@@ -47,9 +51,11 @@ __all__ = [
     "GTPEmbeddingWeight",
     "GTPShardedParam",
     "classify_gtp_chains",
+    "deregister_gtp_buffers_symm",
     "get_ag_stream",
     "get_rs_stream",
     "make_sharded_tensors_for_checkpoint_with_gtp",
+    "register_gtp_buffers_symm",
     "reset_gtp_quantize_cache",
     "set_cuda_graph_mempool",
     "set_cuda_graph_modules",

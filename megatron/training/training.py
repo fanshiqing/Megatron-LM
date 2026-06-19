@@ -1881,6 +1881,17 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         # Critical: ensure side-stream work completes before touching params on default stream
         torch.cuda.current_stream().wait_stream(ddp_stream)
 
+        # GTP symmetric memory: register each DDP buffer's ncclMemAlloc pool on the
+        # GTP group(s) its params requested (`param_needs_nccl_mem`), independent of
+        # --use-nccl-ub. Always symmetric (matches register_gtp_pool), so not tied to
+        # --disable-symmetric-registration. Post-DDP so buffers/pools exist; on the
+        # default stream so the registration collectives are ordered.
+        if HAVE_GTP:
+            from megatron.experimental.gtp import register_gtp_buffers_symm
+
+            for model_module in model:
+                register_gtp_buffers_symm(model_module)
+
         # Broadcast params from data parallel src rank to other data parallel ranks.
         if args.data_parallel_random_init:
             for model_module in model:
@@ -3881,8 +3892,18 @@ def train(
         for model_module in model:
             if isinstance(model_module, DDP):
                 for buf in model_module.buffers + model_module.expert_parallel_buffers:
-                    if getattr(buf, 'nccl_mem_pool', None) is not None:
+                    # DP-group registration is core-owned and only happens under
+                    # --use-nccl-ub; gate on nccl_ub so a GTP-only pool (registered
+                    # on GTP groups but never the DP group) is not deregistered here.
+                    if getattr(buf, 'nccl_ub', False) and getattr(buf, 'nccl_mem_pool', None) is not None:
                         nccl_allocator.deregister_mem_pool(buf.nccl_mem_pool, buf.data_parallel_group)
+        # GTP-group pool registration is owned by the GTP layer (mirror of the
+        # post-DDP register hook), so deregister those groups there.
+        if HAVE_GTP:
+            from megatron.experimental.gtp import deregister_gtp_buffers_symm
+
+            for model_module in model:
+                deregister_gtp_buffers_symm(model_module)
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()

@@ -197,12 +197,16 @@ class nccl_mem:
     An NCCL memory allocator, which inherits APEX nccl_allocator implementation.
     """
 
-    def __init__(self, pool, enabled=True, device=None, group=None, symmetric=True):
+    def __init__(self, pool, enabled=True, device=None, group=None, symmetric=True, register=True):
         self.device = None
         self.group = None
         self.mem_context = None
         self.pool = pool
         self.symmetric = symmetric
+        # register=False: still allocate in the pool (use_mem_pool) and remap, but
+        # skip the deregister/ncclCommRegister entirely -- pooled allocation with
+        # no registration on any group.
+        self.register = register
 
         if enabled:
             if device is None:
@@ -224,7 +228,7 @@ class nccl_mem:
 
     def __enter__(self):
         self.mem_context.__enter__()
-        if self.group is not None:
+        if self.register and self.group is not None:
             # If the pool is not empty, deregister the pool from the group.
             if self.pool.snapshot():
                 backend = self.group._get_backend(self.device)
@@ -242,7 +246,7 @@ class nccl_mem:
                     )
 
     def __exit__(self, *args):
-        if self.group is not None:
+        if self.register and self.group is not None:
             backend = self.group._get_backend(self.device)
             try:
                 # Prefer attempting symmetric registration first; fall back if unsupported.

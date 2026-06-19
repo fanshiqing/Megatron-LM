@@ -167,9 +167,10 @@ class DistributedDataParallelConfig:
 
     disable_symmetric_registration: bool = False
     """If true, disable symmetric (window) registration for NCCL userbuffer registration.
-      This option will force to use conventional (local) userbuffer registration 
+      This option will force to use conventional (local) userbuffer registration
       when nccl_ub is set.
     """
+
 
     fsdp_manual_registration: bool = False
     """If true, manually register the FSDP communication buffers to NCCL user buffer.

@@ -1064,8 +1064,15 @@ class _ParamAndGradBuffer:
         self.extra_main_grads = []
         self.nccl_mem_pool = None
 
-        if self.nccl_ub:
-            # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
+        # Back this buffer with an ncclMemAlloc pool when --use-nccl-ub is set OR a
+        # param requested it via `param_needs_nccl_mem` (set by features like GTP that
+        # window-register the buffer on another group; see register_nccl_pool_on_group).
+        # That attribute targets param_data, which exists only under the distributed
+        # optimizer -- so gate on this buffer's own ddp_config (authoritative, not stale).
+        needs_nccl_mem = self.ddp_config.use_distributed_optimizer and any(
+            getattr(p, "param_needs_nccl_mem", False) for p in self.params
+        )
+        if self.nccl_ub or needs_nccl_mem:
             nccl_allocator.init()
             pool = nccl_allocator.create_nccl_mem_pool(
                 symmetric=not self.ddp_config.disable_symmetric_registration
@@ -1076,15 +1083,19 @@ class _ParamAndGradBuffer:
                 pool,
                 group=self.data_parallel_group,
                 symmetric=not self.ddp_config.disable_symmetric_registration,
+                # Register the pool on the DP group only under --use-nccl-ub; a
+                # symm-only buffer allocates in the pool but skips DP registration.
+                register=self.nccl_ub,
             )
-            # Since nccl communicator group is created lazily, we need to perform a warmup call to
-            # initialize NCCL comm buffers for this dp_group before doing buffer registration.
-            torch.distributed.barrier()
-            tmp_warmup_tensor = torch.zeros([1], device="cuda")
-            torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
-            torch.distributed.barrier()
+            if self.nccl_ub:
+                # NCCL comms are created lazily; warm up the DP group before the
+                # nccl_mem context registers the pool on it.
+                torch.distributed.barrier()
+                tmp_warmup_tensor = torch.zeros([1], device="cuda")
+                torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
+                torch.distributed.barrier()
         else:
-            # If nccl_ub is False, mem_alloc_context is nullcontext.
+            # Neither nccl-ub nor a symm-mem param: mem_alloc_context is nullcontext.
             mem_alloc_context = nullcontext
 
         with mem_alloc_context():
@@ -1286,6 +1297,33 @@ class _ParamAndGradBuffer:
             tp_group=self.tp_group,
             dp_cp_group=self.dp_cp_group,
         )
+
+    def register_nccl_pool_on_group(
+        self, group: torch.distributed.ProcessGroup, symmetric: bool = True
+    ) -> None:
+        """Register this buffer's ncclMemAlloc pool on ``group`` (fresh per-communicator
+        registration; register-once, never deregister). Generic primitive: a caller that
+        runs a collective on ``group`` over this buffer's param_data/grad_data (e.g. the
+        GTP weight all-gather) calls this so NCCL picks symmetric/NVLS kernels.
+        No-op when the buffer has no ncclMemAlloc pool.
+        """
+        if self.nccl_mem_pool is None:
+            return
+        # Warm the group's comm so register_mem_pool sees an initialized
+        # communicator (NCCL comms are created lazily on first collective).
+        warmup = torch.zeros(1, device=torch.cuda.current_device())
+        torch.distributed.all_reduce(warmup, group=group)
+        nccl_allocator.register_mem_pool(self.nccl_mem_pool, group, symmetric=symmetric)
+
+    def deregister_nccl_pool_on_group(self, group: torch.distributed.ProcessGroup) -> None:
+        """Deregister this buffer's pool from ``group`` -- the mirror of
+        ``register_nccl_pool_on_group``. Generic primitive; the caller is
+        responsible for only deregistering groups the pool was registered on.
+        No-op when the buffer is not backed by an ncclMemAlloc pool.
+        """
+        if self.nccl_mem_pool is None:
+            return
+        nccl_allocator.deregister_mem_pool(self.nccl_mem_pool, group)
 
     def _compute_nvfp4_packed_layout(self, params_with_names):
         """Derive packed NVFP4 index map and bucket indices from the primary layout.

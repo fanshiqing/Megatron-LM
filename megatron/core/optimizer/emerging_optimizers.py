@@ -213,6 +213,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.split_qkv = split_qkv
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
+        # Newton-Schulz params, retained so the distributed-GTP orthogonalize path can
+        # call newton_schulz_tp directly (distributed over the GTP group, dim 0).
+        self._muon_num_ns_steps = num_ns_steps
+        self._muon_coefficient_type = coefficient_type
+        self._muon_scale_mode = scale_mode
+        self._muon_extra_scale_factor = extra_scale_factor
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         # Use explicit class call instead of super() so that subclasses with
@@ -230,13 +236,68 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
 
-    def scaled_orthogonalize_fn_with_gtp(self, p, grad, tp_group, partition_dim):
-        """All-gather grad along GTP/EGTP dim 0, orthogonalize, then slice back.
+    def _orthogonalize_distributed(self, grad, group, partition_dim):
+        """Distributed Newton-Schulz over ``group``; ``grad`` is the local shard along
+        ``partition_dim``.
 
-        GTP shards weights along dim 0 independently of TP's partition_dim. Newton-Schulz
-        needs the full weight matrix, so we reconstruct the GTP dimension before running
-        the TP-aware orthogonalization, then extract the local GTP shard from the result.
-        When GTP is inactive this is a plain passthrough to scaled_orthogonalize_fn.
+        Runs NS in distributed mode (each rank keeps its shard; NS only all-reduces the
+        small Gram matrices across ``group``) — no all-gather of the sharded dim and no
+        per-rank-redundant full-matrix NS. The spectral scale uses the full
+        (reconstructed) extent on ``partition_dim``.
+        """
+        size = [grad.size(0), grad.size(1)]
+        size[partition_dim] = grad.size(partition_dim) * get_pg_size(group)
+        orth = newton_schulz_tp(
+            grad,
+            steps=self._muon_num_ns_steps,
+            coefficient_type=self._muon_coefficient_type,
+            tp_group=group,
+            partition_dim=partition_dim,
+            tp_mode="distributed",
+        )
+        scale = get_muon_scale_factor(size[0], size[1], mode=self._muon_scale_mode)
+        return orth * scale * self._muon_extra_scale_factor
+
+    @staticmethod
+    def _all_gather_dim(t, group, dim):
+        """All-gather equal-size shards of ``t`` over ``group`` and concat along ``dim``."""
+        shards = [torch.empty_like(t) for _ in range(get_pg_size(group))]
+        torch.distributed.all_gather(shards, t.contiguous(), group)
+        return torch.cat(shards, dim=dim)
+
+    def scaled_orthogonalize_fn_with_gtp(
+        self, p, grad, tp_group, partition_dim,
+    ):
+        """Orthogonalize a (possibly GTP-row-sharded) momentum.
+
+        GTP shards a ``[M, K]`` weight along dim 0 across a group of size ``g``, so each rank
+        holds a ``[Sp, K]`` row-block where ``Sp = M / g`` (the per-rank shard rows). Newton-Schulz
+        is a whole-matrix op, so that local ``[Sp, K]`` block cannot be orthogonalized alone.
+        Newton-Schulz can instead be DISTRIBUTED
+        over a group along one dim (all-reduce of the small Gram), but only over a single
+        ``(group, partition_dim)``. Strategy:
+
+        - **GTP-only** (TP inactive on this weight): distribute NS over the GTP group, dim 0.
+        - **TP x GTP on different dims** (RowParallel: GTP dim 0, TP dim 1): gather the
+          *smaller* group along its dim and distribute NS over the *larger* group along its
+          dim — minimizes both the gather volume and the residual redundancy.
+        - **TP x GTP on the same dim** (ColumnParallel: both dim 0): gather GTP (dim 0) and
+          run the TP-aware NS. (A combined TPxGTP-group distribution is the proper optimum;
+          gathering on the shared dim is carve-order-sensitive, so kept simple here.)
+
+        When GTP is inactive this is a plain passthrough to ``scaled_orthogonalize_fn``.
+
+        ``self.tp_mode`` (from ``--muon-tp-mode``) is honored for GTP-sharded params, mirroring
+        how ``newton_schulz_tp`` treats TP-sharded params:
+
+        - **blockwise**: orthogonalize the local GTP row-shard independently — no GTP collective.
+          Same per-block approximation TP uses by default; cheapest, but the ``[Sp, K]`` block
+          shrinks as the GTP group grows (``Sp = M/g``), so the approximation degrades at large g.
+        - **duplicated**: all-gather the full matrix over GTP, run whole-matrix NS, reshard —
+          exact, but pays the GTP all-gather plus the gx-redundant NS.
+        - **distributed**: distribute NS over the GTP group via the small-Gram all-reduce —
+          exact, no all-gather and no redundant NS. The strategy bullets above (GTP-only /
+          gather-smaller / ColumnParallel) describe this mode.
         """
         is_expert = getattr(p, 'expert_tp', False)
         gtp_group = (
@@ -249,15 +310,56 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             return self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
 
         gtp_size = get_pg_size(gtp_group)
-        gtp_rank = get_pg_rank(gtp_group)
-        shards = [torch.empty_like(grad) for _ in range(gtp_size)]
-        torch.distributed.all_gather(shards, grad, gtp_group)
-        gathered_grad = torch.cat(shards, dim=0)
 
-        gathered_grad = self.scaled_orthogonalize_fn(gathered_grad, tp_group, partition_dim)
+        if self.tp_mode == "blockwise":
+            # Local block NS on this rank's GTP row-shard (shape [M/gtp_size, K]):
+            # partition_dim=None makes scaled_orthogonalize_fn run a plain Newton-Schulz on
+            # the shard with no GTP/TP collective (orthogonalize() also forces None upstream
+            # for blockwise).
+            return self.scaled_orthogonalize_fn(grad, tp_group, None)
 
-        shard_size = gathered_grad.shape[0] // gtp_size
-        return gathered_grad[gtp_rank * shard_size : (gtp_rank + 1) * shard_size].contiguous()
+        if self.tp_mode == "duplicated":
+            # All-gather the full matrix over GTP (dim 0), orthogonalize the whole tensor
+            # (scaled_orthogonalize_fn handles any TP sharding per tp_mode), reshard dim 0.
+            full = self._all_gather_dim(grad, gtp_group, 0)
+            orth = self.scaled_orthogonalize_fn(full, tp_group, partition_dim)
+            rows = orth.size(0) // gtp_size
+            r = get_pg_rank(gtp_group)
+            return orth[r * rows : (r + 1) * rows].contiguous()
+
+        # distributed (the exact, no-gather path): distribute NS over the GTP group via the
+        # small-Gram all-reduce.
+        tp_active = (
+            partition_dim is not None and tp_group is not None and get_pg_size(tp_group) > 1
+        )
+
+        if not tp_active:
+            # GTP-only: distribute NS over the GTP group on the local dim-0 row shard.
+            return self._orthogonalize_distributed(grad, gtp_group, partition_dim=0)
+
+        tp_size = get_pg_size(tp_group)
+
+        if partition_dim != 0:
+            # RowParallel (TP on dim 1, GTP on dim 0 — different dims): gather the smaller
+            # group, distribute NS over the larger.
+            if gtp_size >= tp_size:
+                full = self._all_gather_dim(grad, tp_group, partition_dim)  # reconstruct TP dim
+                orth = self._orthogonalize_distributed(full, gtp_group, partition_dim=0)
+                cols = orth.size(partition_dim) // tp_size
+                r = get_pg_rank(tp_group)
+                return orth.narrow(partition_dim, r * cols, cols).contiguous()
+            full = self._all_gather_dim(grad, gtp_group, 0)  # reconstruct GTP dim
+            orth = self._orthogonalize_distributed(full, tp_group, partition_dim)
+            rows = orth.size(0) // gtp_size
+            r = get_pg_rank(gtp_group)
+            return orth[r * rows : (r + 1) * rows].contiguous()
+
+        # ColumnParallel (TP and GTP both on dim 0): gather GTP, run TP-aware NS, slice back.
+        gathered = self._all_gather_dim(grad, gtp_group, 0)
+        gathered = self.scaled_orthogonalize_fn(gathered, tp_group, partition_dim)
+        rows = gathered.size(0) // gtp_size
+        r = get_pg_rank(gtp_group)
+        return gathered[r * rows : (r + 1) * rows].contiguous()
 
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.

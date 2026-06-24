@@ -17,6 +17,7 @@ Core implementation: `megatron/experimental/gtp/generalized_tensor_parallelism.p
    - 1.4 [Composability with TP / SP / EP / DDP](#14-composability-with-tp--sp--ep--ddp)
    - 1.5 [Opt-in, minimally invasive integration](#15-opt-in-minimally-invasive-integration)
    - 1.6 [Optimizer-agnostic (Adam + Muon)](#16-optimizer-agnostic-adam--muon)
+     - 1.6.1 [GTP + Muon: Newton–Schulz over a sharded weight](#161-gtp--muon-newtonschulz-over-a-sharded-weight)
    - 1.7 [Scaling](#17-scaling)
    - 1.8 [Native distributed checkpointing (DCP)](#18-native-distributed-checkpointing-dcp)
 2. [Usage](#2-usage)
@@ -134,6 +135,20 @@ GTP runs under both the standard **Adam** `DistributedOptimizer` and **Muon** (t
 - **Muon** keeps matrix params *whole* (Newton–Schulz needs the full 2D weight). A GTP-replicated whole param (e.g. MoE router, latent-proj MLPs) then lands on one checkpoint key shared by all GTP peers, so the LayerWise optimizer folds `gtp_rank` into its `replica_id` — exactly one peer writes (the optimizer-state analog of the model-side fold in §3.3). Mamba `in_proj` (a gathered+split factory on the model side) saves its optimizer state per-shard via a small backfill helper.
 
 Neither path adds a GTP-specific checkpoint format or call site.
+
+#### 1.6.1 GTP + Muon: Newton–Schulz over a sharded weight
+
+Because GTP row-shards the weight, the local `[M/g, K]` block can't be orthogonalized alone (Newton–Schulz is a whole-matrix op). GTP honors `--muon-tp-mode` — the same flag TP uses — mirroring `newton_schulz_tp`:
+
+| `--muon-tp-mode` | how GTP runs NS | collective (group spanned) | exact? |
+|---|---|---|---|
+| `blockwise` *(default)* | orthogonalize the local shard independently | none | no — per-block approx; the `[M/g, K]` block shrinks as `g` grows |
+| `duplicated` | all-gather the full matrix over GTP → whole-matrix NS → reshard | **AllGather over the GTP group** | yes (pays AG + g×-redundant NS) |
+| `distributed` | distribute NS over the GTP group via the small-Gram all-reduce | **AllReduce over the GTP group** (the `[K,K]` Gram) | yes (no AG, no redundant NS) |
+
+The group spanned depends on the weight: **dense** weights use the **GTP group** (above); **routed-expert** weights (`is_expert`) use the **expert-GTP (EGTP) group** instead. For combined **TP × GTP**, `distributed` distributes the Gram all-reduce over one `(group, dim)` and, on RowParallel (different dims), the AllGather spans the *smaller* of the TP/GTP groups while the Gram AllReduce spans the *larger*. The mode is a per-scale trade: `blockwise` is cheapest but the approximation degrades at large `g` (e.g. GTP64), where `distributed` (cheap Gram all-reduce over NVLink) is preferred.
+
+Here `g×-redundant NS` means the whole-matrix Newton–Schulz is recomputed identically on each of the `g` GTP ranks (`g` = GTP group size); `distributed` removes that duplication, splitting the NS across ranks with one small Gram all-reduce per step. Parity across all three modes is covered by `test_gtp_muon.py`.
 
 ### 1.7 Scaling
 
@@ -414,6 +429,7 @@ torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parall
 | `test_gtp_grad_correctness.py` | Gradient + dist-opt + grad-norm numeric parity vs a DP baseline at replicate (DP) > 1. |
 | `test_gtp_cudagraph_grad.py` | Capture-step grad-norm guard (§1.2): `_backup_capture_grads`/`_restore_capture_grads` keep a graph capture from clobbering finalized `main_grad` (own params + cross-graph `next_w`, incl. routed-expert `weight_list`). |
 | `test_gtp_dcp.py` | Distributed-checkpoint sharding (§3.3): TP×GTP composite/cross-axis offsets, alignment-pad `allow_shape_mismatch`, cross-topology reshard metadata, and quantize-cache reset. |
+| `test_gtp_muon.py` | GTP + Muon Newton–Schulz parity (§1.6): the three `--muon-tp-mode` modes (`distributed` / `duplicated` / `blockwise`) on GTP4·TP1, plus TP×GTP RowParallel and ColumnParallel, each vs the full-matrix reference shard. |
 | `test_gtp_muon_dcp.py` | GTP + Muon (LayerWise) optimizer-state checkpoint roundtrip (§1.6): `replica_id` fold for GTP-replicated whole params (router, latent-proj). |
 
 All tests require ≥ 4 GPUs and the GTP-enabled TransformerEngine; they self-skip when those are unavailable. A green run (skips for unmet hardware/config are acceptable) is the minimum bar for any GTP change.

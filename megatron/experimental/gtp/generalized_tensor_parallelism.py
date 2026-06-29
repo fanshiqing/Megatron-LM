@@ -196,6 +196,56 @@ _inflight_comm_params: set = set()
 _AG_STREAMS: Dict[str, torch.cuda.Stream] = {}
 _RS_STREAMS: Dict[str, torch.cuda.Stream] = {}
 
+
+@dataclass
+class GTPCaptureCommState:
+    """Async GTP work issued while capturing one CUDA graph."""
+
+    params: list = field(default_factory=list)
+    ag_streams: list = field(default_factory=list)
+    rs_streams: list = field(default_factory=list)
+    _param_ids: set = field(default_factory=set)
+    _ag_stream_ids: set = field(default_factory=set)
+    _rs_stream_ids: set = field(default_factory=set)
+
+    def register(self, param, reduce_scatter: bool) -> None:
+        param_id = id(param)
+        if param_id not in self._param_ids:
+            self._param_ids.add(param_id)
+            self.params.append(param)
+
+        stream = (
+            get_rs_stream(param.chain_id, param.group)
+            if reduce_scatter
+            else get_ag_stream(param.chain_id, param.group)
+        )
+        stream_id = id(stream)
+        streams = self.rs_streams if reduce_scatter else self.ag_streams
+        stream_ids = self._rs_stream_ids if reduce_scatter else self._ag_stream_ids
+        if stream_id not in stream_ids:
+            stream_ids.add(stream_id)
+            streams.append(stream)
+
+
+_ACTIVE_CAPTURE_COMM_STATE: Optional[GTPCaptureCommState] = None
+
+
+@contextmanager
+def track_gtp_capture_comms():
+    """Track async GTP work owned by one CUDA-graph capture."""
+
+    global _ACTIVE_CAPTURE_COMM_STATE
+    if _ACTIVE_CAPTURE_COMM_STATE is not None:
+        raise RuntimeError("Nested GTP CUDA-graph communication tracking is unsupported")
+
+    state = GTPCaptureCommState()
+    _ACTIVE_CAPTURE_COMM_STATE = state
+    try:
+        yield state
+    finally:
+        _ACTIVE_CAPTURE_COMM_STATE = None
+
+
 # Wgrad input buffer pool, keyed by (shape, dtype). UNGRAPHED-only: GRAPHED
 # wgrad bufs need address stability for CG replay and are not pool-recycled.
 _wgrad_buf_pool: Dict[tuple, list] = {}
@@ -458,6 +508,8 @@ class GTPShardHandle:
         self.gtp_shards = gtp_shards
         self.reduce_scatter = reduce_scatter
         _inflight_comm_params.add(gtp_shards[0])
+        if _ACTIVE_CAPTURE_COMM_STATE is not None:
+            _ACTIVE_CAPTURE_COMM_STATE.register(gtp_shards[0], reduce_scatter)
 
     def wait(self):
         """Wait on the underlying NCCL work and update the shards' state."""
@@ -1643,7 +1695,10 @@ def get_global_GTP_cache() -> GTPWeightCache:
 
 
 def wait_async_comms(
-    chain_id: str = None, skip_rs: bool = False, finalize_after_drain: bool = False
+    chain_id: str = None,
+    skip_rs: bool = False,
+    finalize_after_drain: bool = False,
+    params: Optional[List[GTPShardedParam]] = None,
 ):
     """Drain in-flight GTP async AG / RS handles.
 
@@ -1662,12 +1717,16 @@ def wait_async_comms(
                  NCCL RS) so it starts during AG drain rather than after,
                  avoiding SM-saturation that blocks cross-graph overlap.
                  Falls back to caller-stream accumulation if no RS handle.
+        params: If specified, drain only async work issued by the owning CUDA
+                graph. Outside graph capture, the process-global in-flight set
+                remains the default.
 
     Per-param side effects:
         * _already_ag_drained = True   (if an AG handle was drained)
         * _already_finalized  = True   (if finalize_after_drain=True)
     """
-    for param in list(_inflight_comm_params):
+    comm_params = list(_inflight_comm_params) if params is None else params
+    for param in comm_params:
         if (
             chain_id is not None
             and getattr(param, "chain_id", GTPChain.UNGRAPHED.value) != chain_id
@@ -1683,6 +1742,12 @@ def wait_async_comms(
             param._wait_recompute_param_gather()
             param._recompute_already_drained = True
         if not skip_rs:
+            had_rs = param._wgrad_rs_handle is not None
+            rs_was_in_scope = (
+                had_rs
+                if params is not None
+                else any(w._rs_ticket is not None for w in param._weights)
+            )
             param._wait_reduce_scatter(finalize_grad=finalize_after_drain)
             # Fallback inline-accumulation: only when finalize is requested,
             # _wait_reduce_scatter didn't already finalize, and an RS actually
@@ -1690,8 +1755,8 @@ def wait_async_comms(
             # _inflight_comm_params (no wgrad to accumulate).
             need_fallback_accumulation = (
                 finalize_after_drain
+                and rs_was_in_scope
                 and not getattr(param, "_already_finalized", False)
-                and any(w._rs_ticket is not None for w in param._weights)
             )
             if need_fallback_accumulation:
                 cache = get_global_GTP_cache()

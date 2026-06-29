@@ -72,6 +72,7 @@ if HAVE_GTP:
         get_ag_stream,
         get_rs_stream,
         set_cuda_graph_mempool,
+        track_gtp_capture_comms,
         wait_async_comms,
     )
 else:
@@ -83,6 +84,7 @@ else:
     get_ag_stream = None
     get_rs_stream = None
     set_cuda_graph_mempool = None
+    track_gtp_capture_comms = None
     wait_async_comms = None
 
 try:
@@ -682,8 +684,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
     #    ops that follow see completed data.
     #
     #  Bwd — phased drain (cross-graph RS overlap, see _CudaGraphRunner.backward):
-    #    runner_N.stream:  GEMM ─▶ Phase 1 (drain AG) ─▶ fence ─▶ bwd_completion_event.record ─▶ Phase 2 (wait_side_streams) ─▶ phase2_event
-    #    ag_stream:        AG ──────────────────▶ ag_event.record ▶ fence_event.record
+    #    runner_N.stream:  GEMM ─▶ Phase 1 (drain AG) ─▶ wait_side_streams ─▶ bwd_completion_event.record ─▶ Phase 2 (wait_side_streams) ─▶ phase2_event
+    #    ag_stream:        AG ──────────────────▶ ag_handle.wait
     #    rs_stream:        RS_issue ──▶ handle.wait ▶ rs_event.record ▶ main_grad.add_ ─────────────────────────────────────────────────────┐
     #    main_stream:                                              bwd_completion_event.wait ▶ [next runner]                                  │
     #                                                                                                              phase2_event.wait (in finalize_model_grads) ◀─┘
@@ -951,8 +953,11 @@ class _CudaGraphRunner(torch.nn.Module):
                 _set_skip_fp8_weight_update_tensor(False)
 
     def _register_gtp_side_streams(self, group):
-        """Register a GTP (chain, group)'s GRAPHED AG/RS side streams for capture/replay sync: the
-        AG stream on both fwd and bwd, the RS stream on bwd only."""
+        """Register static streams used by forward capture and GTP warmup.
+
+        Backward capture discovers the exact streams it owns dynamically via
+        track_gtp_capture_comms().
+        """
         ag = get_ag_stream(GTPChain.GRAPHED.value, group)
         rs = get_rs_stream(GTPChain.GRAPHED.value, group)
         self.fwd_side_streams.append(ag)
@@ -1343,9 +1348,12 @@ class _CudaGraphRunner(torch.nn.Module):
         # (Non-GTP returns wgrads as graph outputs and accumulates outside, so nothing to guard.)
         grad_backup = _backup_capture_grads(self) if self.gtp_remat else {}
 
-        with torch.cuda.graph(self.bwd_graph, pool=self.mempool):
-
-            self._sync_against_side_streams(self.bwd_side_streams)
+        capture_comm_context = (
+            track_gtp_capture_comms() if self.gtp_remat else nullcontext(None)
+        )
+        with capture_comm_context as capture_comms, torch.cuda.graph(
+            self.bwd_graph, pool=self.mempool
+        ):
 
             grad_inputs = torch.autograd.grad(
                 outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
@@ -1365,22 +1373,11 @@ class _CudaGraphRunner(torch.nn.Module):
             #             consumer's cascade; for within-graph tails both
             #             happen here (see wait_async_comms).
             if self.gtp_remat:
-                # Phase 1: drain AG; fence runner_stream past dense + EGTP AG
-                # so bwd_completion_event records AFTER NCCL_AG completion.
-                wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True)
-                from megatron.core.parallel_state import (
-                    get_expert_gtp_weight_remat_group,
-                    get_expert_gtp_weight_remat_world_size,
-                    get_gtp_weight_remat_group,
+                # Phase 1: drain AG
+                wait_async_comms(
+                    GTPChain.GRAPHED.value, skip_rs=True, params=capture_comms.params
                 )
-
-                gtp_group = get_gtp_weight_remat_group()
-                graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, gtp_group)
-                torch.cuda.current_stream().wait_stream(graphed_ag)
-                if get_expert_gtp_weight_remat_world_size() > 1:
-                    egtp_group = get_expert_gtp_weight_remat_group()
-                    egtp_graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, egtp_group)
-                    torch.cuda.current_stream().wait_stream(egtp_graphed_ag)
+                self._wait_side_streams(capture_comms.ag_streams)
 
                 # Record completion AFTER AG drain + fence but BEFORE RS drain,
                 # so main_stream can trigger the next runner while RS is still
@@ -1388,12 +1385,13 @@ class _CudaGraphRunner(torch.nn.Module):
                 self.bwd_completion_event.record()
 
                 # Phase 2: in-graph RS drain + finalize.
-                wait_async_comms(GTPChain.GRAPHED.value, finalize_after_drain=True)
+                wait_async_comms(
+                    GTPChain.GRAPHED.value,
+                    finalize_after_drain=True,
+                    params=capture_comms.params,
+                )
+                self._wait_side_streams(capture_comms.rs_streams)
 
-            if self.bwd_side_streams:
-                self._wait_side_streams(self.bwd_side_streams)
-
-            if self.gtp_remat:
                 # Phase 2 + side-stream join done — record so
                 # finalize_model_grads can wait for main_grad.add_ completion.
                 self.bwd_phase2_completion_event.record()

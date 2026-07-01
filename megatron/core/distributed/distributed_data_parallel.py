@@ -498,7 +498,7 @@ class DistributedDataParallel(_BaseDataParallel):
         in a batch).
         """
 
-        def hook(*unused):
+        def hook(*unused, grad_ready_event=None):
             if is_graph_capturing():
                 return
 
@@ -519,7 +519,7 @@ class DistributedDataParallel(_BaseDataParallel):
 
                 if self.ddp_config.overlap_grad_reduce:
                     self.param_to_bucket_group[param].register_grad_ready(
-                        param, self.force_all_reduce
+                        param, self.force_all_reduce, ready_event=grad_ready_event
                     )
 
         return hook

@@ -651,6 +651,10 @@ class GTPShardedParam(torch.nn.Parameter):
         self.rs_state = GTPWeightState.NONE
         self._wgrad_rs_handle = None
         self.rs_event = torch.cuda.Event(external=True)
+        # Recorded after this parameter's reduced gradient has been added to
+        # main_grad. DDP carries this dependency when a mixed bucket is made
+        # ready later from another CUDA stream.
+        self._grad_ready_event = torch.cuda.Event(external=True)
         self._rs_ticket = None
         # Padding
         self.pad_length = 0
@@ -1265,7 +1269,7 @@ class GTPShardedParam(torch.nn.Parameter):
         self._grad_accum_hook = hook
 
     @staticmethod
-    def _handle_megatron_grad_accum(param):
+    def _handle_megatron_grad_accum(param, ready_event=None):
         """Handle megatron DDP and gradient accumulation fusion.
 
         Do NOT set param.grad before calling the hook — the hook checks
@@ -1276,7 +1280,10 @@ class GTPShardedParam(torch.nn.Parameter):
             param.grad_added_to_main_grad = True
         dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype)
         if getattr(param, "_grad_accum_hook", None) is not None:
-            param._grad_accum_hook()
+            if ready_event is None:
+                param._grad_accum_hook()
+            else:
+                param._grad_accum_hook(grad_ready_event=ready_event)
 
         param._set_rs_state(GTPWeightState.NONE)
         return dummy_grad
@@ -1302,12 +1309,13 @@ class GTPShardedParam(torch.nn.Parameter):
                         wgrad_rs = cache.get(w._rs_ticket)
                         w.main_grad.add_(wgrad_rs)
                         cache.release(w._rs_ticket)
+                    self._grad_ready_event.record()
                     # Fire grad-ready AFTER all adds (separate loop so a bucket-completing
                     # grad-ready can't dispatch the RS before a sibling's add). With autograd
                     # grad-ready suppressed for GTP params (DDP register_grad_accum_hook), this
                     # is the only grad-ready for a weight finalized here; else the bucket orphans.
                     for w in self._weights:
-                        self._handle_megatron_grad_accum(w)
+                        self._handle_megatron_grad_accum(w, self._grad_ready_event)
                     self._already_finalized = True
         # Release stashed wgrad inputs: UNGRAPHED buffers go back to the pool;
         # GRAPHED just drops Python refs (addresses must stay stable for CG).
@@ -1422,7 +1430,10 @@ class GTPShardedParam(torch.nn.Parameter):
             else:
                 torch._foreach_add_([p.main_grad for p in weights], wgrads)
             nvtx_range_pop(f"{nvtx_label}.gtp_wgrad_accum")
-            result = [self._handle_megatron_grad_accum(p) for p in weights]
+            self._grad_ready_event.record()
+            result = [
+                self._handle_megatron_grad_accum(p, self._grad_ready_event) for p in weights
+            ]
 
             if poolable:
                 for buf in wgrads:
@@ -1448,8 +1459,9 @@ class GTPShardedParam(torch.nn.Parameter):
                 else:
                     torch._foreach_add_([w.main_grad for w in next_weights], wgrads)
                 nvtx_range_pop(f"{self.next_w._debug_name}.gtp_wgrad_accum_deferred")
+                self.next_w._grad_ready_event.record()
                 for w in next_weights:
-                    self._handle_megatron_grad_accum(w)
+                    self._handle_megatron_grad_accum(w, self.next_w._grad_ready_event)
                     cache.release(w._rs_ticket)
 
         return ret
@@ -1550,8 +1562,8 @@ class GTPWeightCache:
     - ``get(ticket)`` → ``buffer``
       Returns the buffer, lazily allocating from pool or fresh if needed.
     - ``release(ticket)``
-      Returns the buffer to the pool.  Ticket remains valid; next ``get()``
-      will re-allocate from the pool.
+      Returns reusable buffers to the pool. Captured reduce-scatter tickets retain
+      exclusive ownership because independently replayed graphs may overlap.
     - ``clear()``
       Drops all buffers and pools.  Tickets remain valid; next ``get()``
       lazily allocates fresh buffers.
@@ -1665,14 +1677,20 @@ class GTPWeightCache:
         return slot.buf
 
     def release(self, ticket: int):
-        """Return the buffer to the pool.  Ticket remains valid.
+        """Release a reusable buffer to the pool while keeping its ticket valid.
 
-        slot.buf is intentionally NOT cleared: get() must stay idempotent so that
-        CUDA-graph-captured buffers keep their fixed address across replays.
+        Captured reduce-scatter tickets keep exclusive ownership. ``slot.buf`` is never
+        cleared so every CUDA-graph ticket retains a stable address across replays.
         """
         slot = self._slots[ticket]
         if slot.buf is None:
             return
+        # A captured RS ticket must keep exclusive ownership of its output.
+        # Different backward graphs may overlap, so recycling this fixed address
+        # into another ticket would let two graph execs write it.
+        if slot.chain_id == GTPChain.GRAPHED.value and slot.reduce_scatter:
+            return
+
         # Use identity check — tensor == tensor returns a multi-element bool tensor
         # which crashes in a boolean context ("Boolean value of Tensor is ambiguous").
         if not any(b is slot.buf for b in self._pool.get(slot.key, [])):

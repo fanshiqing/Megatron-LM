@@ -808,9 +808,9 @@ class _CudagraphReplayNode(torch.autograd.Function):
             param.grad_added_to_main_grad = grad_added
 
         # DDP's grad-ready hook is silenced during capture and not re-fired at replay, so fire it
-        # here to let DDP RS overlap backward. Fire on each param's rs_stream (the one that ran its
-        # captured main_grad.add_) so FIFO orders DDP-RS after that write; wait_event guards
-        # cross-substream Phase 2. Plan precomputed in create_bwd_graph; main_stream stays free.
+        # here to let DDP RS overlap backward. Carry Phase 2 completion through grad readiness so
+        # whichever param completes a mixed bucket orders its DDP stream after captured main_grad
+        # writes. The replay-invariant hook plan is precomputed in create_bwd_graph.
         if runner.gtp_remat:
             for gtp_rs_stream, params in runner._gtp_finalize_hook_plan:
                 gtp_rs_stream.wait_event(runner.bwd_phase2_completion_event)
@@ -818,7 +818,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
                     for param in params:
                         hook = getattr(param, '_grad_accum_hook', None)
                         if hook is not None:
-                            hook()
+                            hook(grad_ready_event=runner.bwd_phase2_completion_event)
 
         # Replaying the next bwd graph destroys the data held in static_grad_inputs, so clone
         # wgrads as autograd may launch the next graph before wgrads are accumulated

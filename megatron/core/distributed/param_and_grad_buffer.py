@@ -196,6 +196,13 @@ class _ParamAndGradBucketGroup:
             for param in bucket.params_list:
                 self.param_to_bucket[param] = bucket
                 self.params.add(param)
+        self.communication_stream = None
+        if (
+            self.ddp_config.overlap_grad_reduce
+            and self.ddp_config.num_distributed_optimizer_instances == 1
+            and any(getattr(param, "is_gtp", False) for param in self.params)
+        ):
+            self.communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
 
         self.next_param_gather_bucket_group = None
         # Set in DistributedDataParallel.__init__ when reduce_scatter_with_fp32_accumulation is on:
@@ -243,6 +250,7 @@ class _ParamAndGradBucketGroup:
         # The set of keys in per_param_grad_ready_counts should be equal to `params`.
         self.golden_per_param_grad_ready_counts = {}
         self.per_param_grad_ready_counts = {}
+        self.grad_ready_events = {}
         self.is_last_microbatch = True
         self.is_first_batch = True
 
@@ -273,6 +281,7 @@ class _ParamAndGradBucketGroup:
             self.golden_per_param_grad_ready_counts = self.per_param_grad_ready_counts
             self.is_first_batch = False
         self.per_param_grad_ready_counts = {}
+        self.grad_ready_events = {}
         self.is_last_microbatch = True
         self.grad_reduce_finished = False
 
@@ -586,25 +595,41 @@ class _ParamAndGradBucketGroup:
             self.grad_reduce_handle is None
         ), "Should not have multiple communication calls outstanding at once"
 
-        # Copy accumulated .main_grad into communication buffer before collective if
-        # .main_grad is not in .grad_data already (e.g., because we want to do local
-        # gradient accumulation in a higher precision).
-        for bucket in self.buckets:
-            for param in bucket.params_with_extra_main_grads:
-                if getattr(param, 'main_grad_copy_in_grad_buffer', None) is not None:
-                    param.main_grad_copy_in_grad_buffer.copy_(param.main_grad)
+        use_communication_stream = self.ddp_config.overlap_grad_reduce and (
+            self.ddp_config.num_distributed_optimizer_instances > 1
+            or bool(self.grad_ready_events)
+        )
+        if use_communication_stream:
+            assert self.communication_stream is not None
+            self.communication_stream.wait_stream(torch.cuda.current_stream())
+            for event in self.grad_ready_events.values():
+                self.communication_stream.wait_event(event)
 
-        if self.ddp_config.check_for_nan_in_grad or self.ddp_config.check_for_large_grads:
-            self.check_grads(
-                check_for_nan_or_inf=self.ddp_config.check_for_nan_in_grad,
-                check_for_large=self.ddp_config.check_for_large_grads,
-            )
+        def grad_reduce_stream_context():
+            if use_communication_stream:
+                return torch.cuda.stream(self.communication_stream)
+            return nullcontext()
 
-        # gradient_scaling_factor already takes into account whether we are computing
-        # an average or sum in the data-parallel collective.
-        for bucket in self.buckets:
-            if bucket.gradient_scaling_factor != 1.0:
-                bucket.grad_data *= bucket.gradient_scaling_factor
+        with grad_reduce_stream_context():
+            # Copy accumulated .main_grad into communication buffer before collective if
+            # .main_grad is not in .grad_data already (e.g., because we want to do local
+            # gradient accumulation in a higher precision).
+            for bucket in self.buckets:
+                for param in bucket.params_with_extra_main_grads:
+                    if getattr(param, 'main_grad_copy_in_grad_buffer', None) is not None:
+                        param.main_grad_copy_in_grad_buffer.copy_(param.main_grad)
+
+            if self.ddp_config.check_for_nan_in_grad or self.ddp_config.check_for_large_grads:
+                self.check_grads(
+                    check_for_nan_or_inf=self.ddp_config.check_for_nan_in_grad,
+                    check_for_large=self.ddp_config.check_for_large_grads,
+                )
+
+            # gradient_scaling_factor already takes into account whether we are computing
+            # an average or sum in the data-parallel collective.
+            for bucket in self.buckets:
+                if bucket.gradient_scaling_factor != 1.0:
+                    bucket.grad_data *= bucket.gradient_scaling_factor
 
         # Decide reduce_op.
         reduce_op = torch.distributed.ReduceOp.SUM
@@ -623,20 +648,6 @@ class _ParamAndGradBucketGroup:
             self.ddp_config.overlap_grad_reduce
             and self.ddp_config.num_distributed_optimizer_instances == 1
         )
-        if (
-            self.ddp_config.num_distributed_optimizer_instances > 1
-            and self.ddp_config.overlap_grad_reduce
-        ):
-            # Assign a communication stream if we have multiple DistOpt instances and we
-            # need to overlap communication.
-            stream_context = torch.cuda.stream(self.communication_stream)
-
-            # The RS/AR communication stream needs to wait for the current stream
-            # to complete its gradient computation before launching the next
-            # gradient reduction collective.
-            self.communication_stream.wait_stream(torch.cuda.current_stream())
-        else:
-            stream_context = nullcontext()
 
         if self.ddp_config.use_distributed_optimizer:
             communication_group = self.intra_distributed_optimizer_instance_group
@@ -645,7 +656,10 @@ class _ParamAndGradBucketGroup:
 
         # Coalesce communication kernels across buckets in the bucket group.
         grad_reduce_handle = None
-        with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
+        with (
+            grad_reduce_stream_context(),
+            _coalescing_manager(communication_group, async_ops=async_op) as cm,
+        ):
             for idx, bucket in enumerate(self.buckets):
                 if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
                     if self.cached_grad_buffer_shard_list[idx] is None:
@@ -679,7 +693,7 @@ class _ParamAndGradBucketGroup:
             assert self.inter_distributed_optimizer_instance_group is not None
             # Create a new coalescing manager for the inter-instance all-reduce.
             with (
-                stream_context,
+                grad_reduce_stream_context(),
                 _coalescing_manager(
                     self.inter_distributed_optimizer_instance_group, async_ops=async_op
                 ) as cm,
@@ -796,7 +810,10 @@ class _ParamAndGradBucketGroup:
                     param.main_grad.copy_(param.main_grad_copy_in_grad_buffer)
 
     def register_grad_ready(
-        self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False
+        self,
+        param: torch.nn.Parameter,
+        force_all_reduce: Optional[bool] = False,
+        ready_event: Optional[torch.cuda.Event] = None,
     ):
         """
         Registers grads for the passed-in param to be "ready" for grad sync.
@@ -809,6 +826,8 @@ class _ParamAndGradBucketGroup:
             self.ddp_config.overlap_grad_reduce
         ), "register_grad_ready() should only be called when overlap_grad_reduce is True"
         if self.is_last_microbatch:
+            if ready_event is not None:
+                self.grad_ready_events[id(ready_event)] = ready_event
             assert param in self.param_to_bucket, "Param is not in the bucket group"
             if param not in self.per_param_grad_ready_counts:
                 self.per_param_grad_ready_counts[param] = 0

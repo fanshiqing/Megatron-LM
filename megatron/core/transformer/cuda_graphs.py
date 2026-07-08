@@ -71,6 +71,7 @@ if HAVE_GTP:
         GTPChain,
         get_ag_stream,
         get_rs_stream,
+        initialize_graph_wgrad_rings,
         set_cuda_graph_mempool,
         track_gtp_capture_comms,
         wait_async_comms,
@@ -83,6 +84,7 @@ else:
     GTPChain = None
     get_ag_stream = None
     get_rs_stream = None
+    initialize_graph_wgrad_rings = None
     set_cuda_graph_mempool = None
     track_gtp_capture_comms = None
     wait_async_comms = None
@@ -500,6 +502,7 @@ class _CudagraphGlobalRecord:
         if gtp_active:
             # GTP buffer reuse during capture trips the param-state debug asserts; disable them.
             GTP_CONFIG.check_param_states = False
+            initialize_graph_wgrad_rings()
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -787,6 +790,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
 
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
+            for slot in runner._gtp_wgrad_ring_slots:
+                runner.stream.wait_event(slot.ready_event)
             with torch.cuda.stream(runner.stream):
                 runner.bwd_graph.replay()
             torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
@@ -818,7 +823,10 @@ class _CudagraphReplayNode(torch.autograd.Function):
                     for param in params:
                         hook = getattr(param, '_grad_accum_hook', None)
                         if hook is not None:
-                            hook(grad_ready_event=runner.bwd_phase2_completion_event)
+                            if GTP_CONFIG.pass_grad_ready_event_to_ddp:
+                                hook(grad_ready_event=runner.bwd_phase2_completion_event)
+                            else:
+                                hook()
 
         # Replaying the next bwd graph destroys the data held in static_grad_inputs, so clone
         # wgrads as autograd may launch the next graph before wgrads are accumulated
@@ -885,6 +893,9 @@ class _CudaGraphRunner(torch.nn.Module):
         self.finalized_during_bwd_capture = []
         # (rs_stream, params) DDP grad-ready hook plan; built in create_bwd_graph.
         self._gtp_finalize_hook_plan = []
+        # Persistent wgrad slots written by this graph. Replay waits for each
+        # slot's previous RS reader before launching the graph.
+        self._gtp_wgrad_ring_slots = []
 
         self.grad_enabled = need_backward and torch.is_grad_enabled()
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
@@ -1410,6 +1421,9 @@ class _CudaGraphRunner(torch.nn.Module):
         # See _compute_finalized_during_bwd_capture for what's in this set and why.
         self.finalized_during_bwd_capture = (
             self._compute_finalized_during_bwd_capture() if self.gtp_remat else []
+        )
+        self._gtp_wgrad_ring_slots = (
+            list(capture_comms.wgrad_ring_slots) if self.gtp_remat else []
         )
 
         # Precompute the (rs_stream, params) DDP grad-ready hook plan once — it's

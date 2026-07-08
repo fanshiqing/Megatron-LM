@@ -469,12 +469,6 @@ class GTPConfig:
     # directly into GTPShardedParam.quantized; forward's _quantize_if_needed
     # short-circuits to the cached FP8. Moves BF16->FP8 off the fwd critical path.
     fp8_param_gather: bool = False
-    # Forward the CUDA event that marks GTP main_grad completion into DDP's
-    # grad-ready hook. Disable only for controlled A/B validation of whether
-    # DDP bucket communication needs this cross-stream dependency.
-    pass_grad_ready_event_to_ddp: bool = (
-        os.getenv("MEGATRON_GTP_PASS_GRAD_READY_EVENT", "1") == "1"
-    )
     # Persistent wgrad slots per scheduling/shape domain for partial-CG async
     # reduce-scatter. Two slots allow graph N+1 compute to overlap graph N's RS.
     graph_wgrad_ring_size: int = 2
@@ -787,10 +781,6 @@ class GTPShardedParam(torch.nn.Parameter):
         self.rs_state = GTPWeightState.NONE
         self._wgrad_rs_handle = None
         self.rs_event = torch.cuda.Event(external=True)
-        # Recorded after this parameter's reduced gradient has been added to
-        # main_grad. DDP carries this dependency when a mixed bucket is made
-        # ready later from another CUDA stream.
-        self._grad_ready_event = torch.cuda.Event(external=True)
         self._rs_ticket = None
         # Padding
         self.pad_length = 0
@@ -1425,7 +1415,7 @@ class GTPShardedParam(torch.nn.Parameter):
         self._grad_accum_hook = hook
 
     @staticmethod
-    def _handle_megatron_grad_accum(param, ready_event=None):
+    def _handle_megatron_grad_accum(param):
         """Handle megatron DDP and gradient accumulation fusion.
 
         Do NOT set param.grad before calling the hook — the hook checks
@@ -1436,10 +1426,7 @@ class GTPShardedParam(torch.nn.Parameter):
             param.grad_added_to_main_grad = True
         dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype)
         if getattr(param, "_grad_accum_hook", None) is not None:
-            if ready_event is None or not GTP_CONFIG.pass_grad_ready_event_to_ddp:
-                param._grad_accum_hook()
-            else:
-                param._grad_accum_hook(grad_ready_event=ready_event)
+            param._grad_accum_hook()
 
         param._set_rs_state(GTPWeightState.NONE)
         return dummy_grad
@@ -1466,13 +1453,12 @@ class GTPShardedParam(torch.nn.Parameter):
                         wgrad_rs = cache.get(w._rs_ticket)
                         w.main_grad.add_(wgrad_rs)
                         cache.release(w._rs_ticket)
-                    self._grad_ready_event.record()
                     # Fire grad-ready AFTER all adds (separate loop so a bucket-completing
                     # grad-ready can't dispatch the RS before a sibling's add). With autograd
                     # grad-ready suppressed for GTP params (DDP register_grad_accum_hook), this
                     # is the only grad-ready for a weight finalized here; else the bucket orphans.
                     for w in self._weights:
-                        self._handle_megatron_grad_accum(w, self._grad_ready_event)
+                        self._handle_megatron_grad_accum(w)
                     self._already_finalized = True
         # Release stashed wgrad inputs: UNGRAPHED buffers go back to the pool;
         # GRAPHED just drops Python refs (addresses must stay stable for CG).
@@ -1626,10 +1612,7 @@ class GTPShardedParam(torch.nn.Parameter):
             else:
                 torch._foreach_add_([p.main_grad for p in weights], wgrads)
             nvtx_range_pop(f"{nvtx_label}.gtp_wgrad_accum")
-            self._grad_ready_event.record()
-            result = [
-                self._handle_megatron_grad_accum(p, self._grad_ready_event) for p in weights
-            ]
+            result = [self._handle_megatron_grad_accum(p) for p in weights]
 
             if poolable:
                 for buf in wgrads:
@@ -1655,9 +1638,8 @@ class GTPShardedParam(torch.nn.Parameter):
                 else:
                     torch._foreach_add_([w.main_grad for w in next_weights], wgrads)
                 nvtx_range_pop(f"{self.next_w._debug_name}.gtp_wgrad_accum_deferred")
-                self.next_w._grad_ready_event.record()
                 for w in next_weights:
-                    self._handle_megatron_grad_accum(w, self.next_w._grad_ready_event)
+                    self._handle_megatron_grad_accum(w)
                     cache.release(w._rs_ticket)
 
         return ret

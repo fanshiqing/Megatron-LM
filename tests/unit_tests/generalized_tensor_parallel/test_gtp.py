@@ -28,6 +28,7 @@ Test groups
 22. TestWaitAsyncCommsFallback   - wait_async_comms(finalize_after_drain=True) inline-accumulation fallback when _wgrad_rs_handle is None (single-process)
 23. TestGTPDDPBucketAlignment    - GTP and regular DDP buffer bucket ends padded for dist-opt alignment (multi-GPU)
 24. TestGTPDDPGradReadyWiring    - GTP params drive DDP grad-ready via the manual hook after wgrad add, not autograd (multi-GPU)
+25. TestGTPGraphWgradRing        - partial-CG wgrad ring ownership and fallback equivalence (CUDA)
 
 Multi-GPU tests skip when ``torch.distributed.get_world_size()`` doesn't match the required
 world size (4 for everything in this file).
@@ -49,7 +50,7 @@ from transformer_engine.pytorch import fp8_autocast
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
 
 import megatron.experimental.gtp.generalized_tensor_parallelism as gtp_module
-from megatron.experimental.gtp import GTPShardedParam, wrap_module_params_gtp
+from megatron.experimental.gtp import GTPChain, GTPShardedParam, wrap_module_params_gtp
 from megatron.experimental.gtp.generalized_tensor_parallelism import GTPWeightCache, GTPWeightState
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _make_gtp_grouped_linear,
@@ -157,6 +158,37 @@ class TestGTPWeightCache:
         assert buf1 is buf2, "Buffer should be reused from pool after release"
         cache.release(t2)
 
+    def test_cache_isolated_by_scheduling_domain(self):
+        cache = GTPWeightCache()
+        group = _FakeGroup(size=2)
+        other_group = _FakeGroup(size=2)
+        first = self._param()
+        first.group = group
+        first.chain_id = GTPChain.UNGRAPHED.value
+        second = self._param()
+        second.group = group
+        second.chain_id = GTPChain.UNGRAPHED.value
+
+        first_ticket = cache.reserve(first, torch.bfloat16, fwd=True)
+        first_buf = cache.get(first_ticket)
+        cache.release(first_ticket)
+        second_ticket = cache.reserve(second, torch.bfloat16, fwd=True)
+        second_buf = cache.get(second_ticket)
+        assert second_buf is first_buf
+        cache.release(second_ticket)
+
+        graphed = self._param()
+        graphed.group = group
+        graphed.chain_id = GTPChain.GRAPHED.value
+        graphed_ticket = cache.reserve(graphed, torch.bfloat16, fwd=True)
+        assert cache.get(graphed_ticket) is not first_buf
+
+        other = self._param()
+        other.group = other_group
+        other.chain_id = GTPChain.UNGRAPHED.value
+        other_ticket = cache.reserve(other, torch.bfloat16, fwd=True)
+        assert cache.get(other_ticket) is not first_buf
+
     def test_two_simultaneous_reserves_are_distinct(self):
         cache = GTPWeightCache()
         p = self._param()
@@ -181,8 +213,10 @@ class TestGTPWeightCache:
 
     def test_different_shapes_use_distinct_pool_slots(self):
         cache = GTPWeightCache()
+        group = _FakeGroup(size=2)
         p1 = self._param(shape=(8, 4))
         p2 = self._param(shape=(16, 4))
+        p1.group = p2.group = group
         t1 = cache.reserve(p1, torch.bfloat16, fwd=True)
         buf1 = cache.get(t1)
         t2 = cache.reserve(p2, torch.bfloat16, fwd=True)
@@ -985,8 +1019,10 @@ class TestGTPCacheKey:
 
     def test_same_expert_idx_same_key(self):
         """Same-shaped experts with the same idx share a cache key (cross-layer buffer reuse)."""
+        group = _FakeGroup(size=4)
         p_l0 = self._param(expert_idx=0)
         p_l1 = self._param(expert_idx=0)
+        p_l0.group = p_l1.group = group
         assert p_l0._get_cache_key(
             torch.bfloat16, fwd=True, reduce_scatter=False
         ) == p_l1._get_cache_key(torch.bfloat16, fwd=True, reduce_scatter=False)
@@ -1484,3 +1520,86 @@ class TestGTPDDPGradReadyWiring:
         """GTP params route DDP grad-ready through register_grad_accum_hook, not autograd."""
         _requires_multi_gpu(4)
         _run_distributed(_worker_gtp_ddp_grad_ready_wiring, 4)
+
+
+# ---------------------------------------------------------------------------
+# 25. Partial-CG GTP wgrad ring: ownership and fallback equivalence
+# ---------------------------------------------------------------------------
+
+
+class TestGTPGraphWgradRing:
+    @staticmethod
+    def _make_padded_chain(count=4):
+        group = _FakeGroup(size=2)
+        weights = [GTPShardedParam(torch.randn(3, 4, device="cuda")) for _ in range(count)]
+        for weight in weights:
+            weight.group = group
+            weight.chain_id = GTPChain.GRAPHED.value
+            weight.pad_length = 2
+            weight.main_grad = torch.empty_like(weight)
+        for previous, current in zip(weights, weights[1:]):
+            previous.next_w = current
+            current.prev_w = previous
+        return weights
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
+    def test_partial_cg_wgrad_ring_ownership(self, monkeypatch):
+        monkeypatch.setattr(gtp_module, "_FULL_ITERATION", False)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "cross_cg_overlap", True)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "async_reduction", True)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "graph_wgrad_ring_size", 2)
+        monkeypatch.setattr(gtp_module, "_GRAPH_WGRAD_RINGS", {})
+
+        weights = self._make_padded_chain()
+        monkeypatch.setattr(gtp_module, "_GTP_PARAMS", weights)
+
+        gtp_module.initialize_graph_wgrad_rings()
+
+        slot_1 = weights[1]._gtp_graph_wgrad_ring_slot
+        slot_2 = weights[2]._gtp_graph_wgrad_ring_slot
+        slot_3 = weights[3]._gtp_graph_wgrad_ring_slot
+        assert slot_1 is not slot_2
+        assert slot_1 is slot_3
+        assert len(gtp_module._GRAPH_WGRAD_RINGS) == 1
+        assert slot_1.ready_event.query()
+
+        logical_view = weights[1].get_wgrad_tensor()
+        assert slot_1.tensor.shape == (6, 4)
+        assert logical_view.shape == (4, 4)
+        assert logical_view.data_ptr() == slot_1.tensor.data_ptr()
+
+        logical_view.fill_(7)
+        prepared = weights[1]._prepare_wgrad_reduce_scatter_inputs([logical_view])
+        assert prepared[0] is slot_1.tensor
+        assert torch.count_nonzero(slot_1.tensor[4:]) == 0
+
+        capture_state = gtp_module.GTPCaptureCommState()
+        capture_state.register_wgrad_ring_slot(slot_1, weights[1])
+        with pytest.raises(RuntimeError, match="increase GTP_CONFIG.graph_wgrad_ring_size"):
+            capture_state.register_wgrad_ring_slot(slot_1, weights[3])
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
+    def test_cross_cg_overlap_rs_input_matches_fallback(self, monkeypatch):
+        monkeypatch.setattr(gtp_module, "_FULL_ITERATION", False)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "async_reduction", True)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "graph_wgrad_ring_size", 2)
+        monkeypatch.setattr(gtp_module, "_GRAPH_WGRAD_RINGS", {})
+
+        fallback_weights = self._make_padded_chain(count=2)
+        monkeypatch.setattr(gtp_module, "_GTP_PARAMS", fallback_weights)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "cross_cg_overlap", False)
+        gtp_module.initialize_graph_wgrad_rings()
+        assert not gtp_module._GRAPH_WGRAD_RINGS
+        assert not hasattr(fallback_weights[1], "_gtp_graph_wgrad_ring_slot")
+
+        wgrad = torch.arange(16, dtype=torch.float32, device="cuda").reshape(4, 4)
+        fallback_input = fallback_weights[1]._prepare_wgrad_reduce_scatter_inputs([wgrad])[0]
+
+        optimized_weights = self._make_padded_chain(count=2)
+        monkeypatch.setattr(gtp_module, "_GTP_PARAMS", optimized_weights)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "cross_cg_overlap", True)
+        gtp_module.initialize_graph_wgrad_rings()
+        optimized_input = optimized_weights[1]._prepare_wgrad_reduce_scatter_inputs([wgrad])[0]
+
+        assert optimized_input is optimized_weights[1]._gtp_graph_wgrad_ring_slot.tensor
+        torch.testing.assert_close(optimized_input, fallback_input)

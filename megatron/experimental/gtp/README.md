@@ -238,7 +238,8 @@ At iter-0 you'll see one rank-0 log line confirming the active config:
 
 ```
 GTP enabled. GTPConfig(pad_for_alignment=16, check_param_states=False,
-  weight_prefetch=True, async_reduction=True, fp8_param_gather=False)
+  weight_prefetch=True, async_reduction=True, fp8_param_gather=False,
+  cross_cg_overlap=True)
 ```
 
 ### 2.4 Tuning knobs
@@ -251,8 +252,13 @@ update_gtp_config(
     weight_prefetch=True,         # Disable to debug the cold-start path
     async_reduction=True,         # Whether to perform GTP gradient reduction asynchronously
     fp8_param_gather=False,       # Companion to Megatron's --fp8-param-gather; currently asserted off
+    cross_cg_overlap=True,        # Overlap one partial graph's GTP RS with its successor
 )
 ```
+
+GTP backward RS overlap across local CUDA graph boundaries is enabled by default. Pass
+`--disable-gtp-local-cg-backward-rs-overlap` to use the fallback that drains GTP RS before
+releasing the next local CUDA graph.
 
 `training.py` auto-tunes `pad_for_alignment` based on the quantization recipe (`--fp4`, `--fp8-recipe=mxfp8`, etc.) before model construction. The other knobs are usually left at defaults.
 

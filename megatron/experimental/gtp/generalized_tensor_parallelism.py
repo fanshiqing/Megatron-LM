@@ -349,7 +349,12 @@ def initialize_graph_wgrad_rings() -> None:
     domain. A two-slot ring retains one graph of overlap without allocating one
     full unsharded wgrad per layer.
     """
-    if _FULL_ITERATION or not GTP_CONFIG.async_reduction or _GRAPH_WGRAD_RINGS:
+    if (
+        not GTP_CONFIG.cross_cg_overlap
+        or _FULL_ITERATION
+        or not GTP_CONFIG.async_reduction
+        or _GRAPH_WGRAD_RINGS
+    ):
         return
 
     ring_size = GTP_CONFIG.graph_wgrad_ring_size
@@ -469,6 +474,9 @@ class GTPConfig:
     # directly into GTPShardedParam.quantized; forward's _quantize_if_needed
     # short-circuits to the cached FP8. Moves BF16->FP8 off the fwd critical path.
     fp8_param_gather: bool = False
+    # Let a partial CUDA graph release its successor before this graph's GTP
+    # reduce-scatter has finished. Disable to drain RS before graph completion.
+    cross_cg_overlap: bool = True
     # Persistent wgrad slots per scheduling/shape domain for partial-CG async
     # reduce-scatter. Two slots allow graph N+1 compute to overlap graph N's RS.
     graph_wgrad_ring_size: int = 2
@@ -1392,7 +1400,11 @@ class GTPShardedParam(torch.nn.Parameter):
 
     def get_wgrad_tensor(self):
         """Return a logical-shape view of stable ring storage or ordinary scratch."""
-        ring_slot = getattr(self, "_gtp_graph_wgrad_ring_slot", None)
+        ring_slot = (
+            getattr(self, "_gtp_graph_wgrad_ring_slot", None)
+            if GTP_CONFIG.cross_cg_overlap
+            else None
+        )
         if ring_slot is not None:
             if _ACTIVE_CAPTURE_COMM_STATE is not None:
                 _ACTIVE_CAPTURE_COMM_STATE.register_wgrad_ring_slot(ring_slot, self)
@@ -1470,6 +1482,8 @@ class GTPShardedParam(torch.nn.Parameter):
 
     def _record_graph_wgrad_ring_slots_ready(self) -> None:
         """Publish that this RS has finished reading its persistent input slots."""
+        if not GTP_CONFIG.cross_cg_overlap:
+            return
         seen = set()
         for weight in self._weights:
             slot = getattr(weight, "_gtp_graph_wgrad_ring_slot", None)
@@ -1554,7 +1568,11 @@ class GTPShardedParam(torch.nn.Parameter):
         """
         prepared = []
         for weight, wgrad in zip(self._weights, wgrads):
-            slot = getattr(weight, "_gtp_graph_wgrad_ring_slot", None)
+            slot = (
+                getattr(weight, "_gtp_graph_wgrad_ring_slot", None)
+                if GTP_CONFIG.cross_cg_overlap
+                else None
+            )
             if slot is None:
                 if weight.pad_length > 0:
                     wgrad = torch.nn.functional.pad(

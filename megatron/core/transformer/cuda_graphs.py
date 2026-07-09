@@ -790,8 +790,9 @@ class _CudagraphReplayNode(torch.autograd.Function):
 
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
-            for slot in runner._gtp_wgrad_ring_slots:
-                runner.stream.wait_event(slot.ready_event)
+            if GTP_CONFIG.cross_cg_overlap:
+                for slot in runner._gtp_wgrad_ring_slots:
+                    runner.stream.wait_event(slot.ready_event)
             with torch.cuda.stream(runner.stream):
                 runner.bwd_graph.replay()
             torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
@@ -1387,10 +1388,9 @@ class _CudaGraphRunner(torch.nn.Module):
                 )
                 self._wait_side_streams(capture_comms.ag_streams)
 
-                # Record completion AFTER AG drain + fence but BEFORE RS drain,
-                # so main_stream can trigger the next runner while RS is still
-                # in flight on rs_stream.
-                self.bwd_completion_event.record()
+                if GTP_CONFIG.cross_cg_overlap:
+                    # Release the next runner after AG drain but before RS drain.
+                    self.bwd_completion_event.record()
 
                 # Phase 2: in-graph RS drain + finalize.
                 wait_async_comms(
@@ -1403,6 +1403,11 @@ class _CudaGraphRunner(torch.nn.Module):
                 # Phase 2 + side-stream join done — record so
                 # finalize_model_grads can wait for main_grad.add_ completion.
                 self.bwd_phase2_completion_event.record()
+
+                if not GTP_CONFIG.cross_cg_overlap:
+                    # Fallback: do not release the next graph until RS and
+                    # main_grad finalization have completed.
+                    self.bwd_completion_event.record()
 
             if self.use_stream and not self.gtp_remat:
                 # Non-GTP path: record after the side-stream join.

@@ -30,6 +30,12 @@ _TENSOR_MODEL_PARALLEL_GROUP = None
 # Generalized tensor parallelism group that the current rank belongs to.
 _GTP_WEIGHT_REMAT_GROUP = None
 _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
+# Shadow duplicate of the GTP remat group (same ranks + rank ORDER as the main group, its
+# own NCCL comm) used ONLY for the backward reduce-scatter, so it runs on a separate stream
+# and can overlap the all-gather. Selected by IDENTITY against the main group in
+# get_gtp_rs_shadow_group, so custom / manually-supplied groups fall back to self.group.
+# Created only when GTP_DECOUPLE_AGRS=1; otherwise None.
+_GTP_WEIGHT_REMAT_RS_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
@@ -56,6 +62,8 @@ _TENSOR_AND_DATA_PARALLEL_GROUP = None
 # Expert generalized tensor parallelism group that current rank belongs to.
 _EXPERT_GTP_WEIGHT_REMAT_GROUP = None
 _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
+# Shadow RS comm for the expert (EGTP) remat group. See the dense variant above.
+_EXPERT_GTP_WEIGHT_REMAT_RS_GROUP = None
 # Expert model parallel group that current rank belongs to.
 _EXPERT_MODEL_PARALLEL_GROUP = None
 # Expert tensor parallel group that current rank belongs to.
@@ -933,9 +941,11 @@ def initialize_model_parallel(
     # while CP only shards activations — they are independent and can share ranks.
     global _GTP_WEIGHT_REMAT_GROUP
     global _GTP_WEIGHT_REMAT_GLOBAL_RANKS
+    global _GTP_WEIGHT_REMAT_RS_GROUP
     assert (
         _GTP_WEIGHT_REMAT_GROUP is None
     ), "generalized tensor parallel group is already initialized"
+    _decouple_ag_rs = os.environ.get("GTP_DECOUPLE_AGRS", "0") == "1"
     for gtp_ranks in decoder_rank_generator.get_gtp_ranks(gtp_remat_size):
         group = create_group(
             gtp_ranks,
@@ -943,9 +953,27 @@ def initialize_model_parallel(
             pg_options=get_nccl_options("gtp_remat", nccl_comm_cfgs),
             group_desc="GTP_WEIGHT_REMAT_GROUP",
         )
+        # Shadow RS comm: same ranks on a separate NCCL communicator so the backward
+        # reduce-scatter overlaps the all-gather. Mirror the main gtp_remat group's NCCL
+        # options and override only the stream priority — GTP_RS_LOW_PRIO=1 makes it
+        # normal-priority so the RS runs below the high-priority all-gather. create_group is
+        # collective, so every rank builds it for every rank-set in the loop.
+        rs_group = None
+        if _decouple_ag_rs:
+            rs_opts = get_nccl_options("gtp_remat", nccl_comm_cfgs) or (
+                torch.distributed.ProcessGroupNCCL.Options()
+            )
+            rs_opts.is_high_priority_stream = os.environ.get("GTP_RS_LOW_PRIO", "0") != "1"
+            rs_group = create_group(
+                gtp_ranks,
+                timeout=timeout,
+                pg_options=rs_opts,
+                group_desc="GTP_WEIGHT_REMAT_RS_GROUP",
+            )
         if rank in gtp_ranks:
             _GTP_WEIGHT_REMAT_GROUP = group
             _GTP_WEIGHT_REMAT_GLOBAL_RANKS = gtp_ranks
+            _GTP_WEIGHT_REMAT_RS_GROUP = rs_group
 
     # Disable Gloo under GTP_remat (out of scope; the GTP_remat optimizer uses DCP).
     if gtp_remat_size > 1:
@@ -1335,9 +1363,11 @@ def initialize_model_parallel(
     # Expert GTP_remat overlaps with the expert DP domain (experts don't use CP).
     global _EXPERT_GTP_WEIGHT_REMAT_GROUP
     global _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS
+    global _EXPERT_GTP_WEIGHT_REMAT_RS_GROUP
     assert (
         _EXPERT_GTP_WEIGHT_REMAT_GROUP is None
     ), 'Expert generalized tensor parallel group is already initialized'
+    _decouple_ag_rs = os.environ.get("GTP_DECOUPLE_AGRS", "0") == "1"
     # EGTP shard groups are get_ranks('gtp_remat') on the expert generator (singletons when
     # expert_gtp_remat_size == 1). See RankGenerator.get_gtp_ranks.
     for egtp_ranks in expert_decoder_rank_generator.get_gtp_ranks(expert_gtp_remat_size):
@@ -1347,9 +1377,24 @@ def initialize_model_parallel(
             pg_options=get_nccl_options("expt_gtp_remat", nccl_comm_cfgs),
             group_desc="EXPERT_GTP_WEIGHT_REMAT_GROUP",
         )
+        # Shadow RS comm for EGTP: mirror the expt_gtp_remat group's NCCL options, override
+        # only the stream priority (GTP_RS_LOW_PRIO). See the dense group above.
+        rs_group = None
+        if _decouple_ag_rs:
+            rs_opts = get_nccl_options("expt_gtp_remat", nccl_comm_cfgs) or (
+                torch.distributed.ProcessGroupNCCL.Options()
+            )
+            rs_opts.is_high_priority_stream = os.environ.get("GTP_RS_LOW_PRIO", "0") != "1"
+            rs_group = create_group(
+                egtp_ranks,
+                timeout=timeout,
+                pg_options=rs_opts,
+                group_desc="EXPERT_GTP_WEIGHT_REMAT_RS_GROUP",
+            )
         if rank in egtp_ranks:
             _EXPERT_GTP_WEIGHT_REMAT_GROUP = group
             _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = egtp_ranks
+            _EXPERT_GTP_WEIGHT_REMAT_RS_GROUP = rs_group
 
     # Build the expert model parallel group
     global _EXPERT_MODEL_PARALLEL_GROUP, _EXPERT_MODEL_PARALLEL_RANKS
@@ -1717,6 +1762,21 @@ def get_gtp_weight_remat_group(check_initialized=True):
             _GTP_WEIGHT_REMAT_GROUP is not None
         ), "generalized tensor parallel group is not initialized"
     return _GTP_WEIGHT_REMAT_GROUP
+
+
+def get_gtp_rs_shadow_group(group):
+    """Return the shadow reduce-scatter communicator for a GTP/EGTP ``group`` — same ranks and
+    rank ORDER as ``group`` (built from the same rank list), on its own NCCL comm so the
+    backward RS can overlap the all-gather. Matched by IDENTITY against the remat group that
+    ``group`` actually is, so the RS comm is derived from the caller's own group; any other
+    group (a custom / manually-supplied ProcessGroupCollection, or GTP_DECOUPLE_AGRS off → the
+    shadow is None) falls back to ``group`` itself, keeping the RS on the correct communicator.
+    Internal to the GTP module."""
+    if group is _GTP_WEIGHT_REMAT_GROUP:
+        return _GTP_WEIGHT_REMAT_RS_GROUP or group
+    if group is _EXPERT_GTP_WEIGHT_REMAT_GROUP:
+        return _EXPERT_GTP_WEIGHT_REMAT_RS_GROUP or group
+    return group
 
 
 def get_gtp_weight_remat_world_size():
@@ -2514,6 +2574,9 @@ def destroy_model_parallel():
     global _GTP_WEIGHT_REMAT_GROUP
     _GTP_WEIGHT_REMAT_GROUP = None
 
+    global _GTP_WEIGHT_REMAT_RS_GROUP
+    _GTP_WEIGHT_REMAT_RS_GROUP = None
+
     global _GTP_WEIGHT_REMAT_GLOBAL_RANKS
     _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
 
@@ -2603,6 +2666,9 @@ def destroy_model_parallel():
     # Destroy parallel state related to expert parallelism.
     global _EXPERT_GTP_WEIGHT_REMAT_GROUP
     _EXPERT_GTP_WEIGHT_REMAT_GROUP = None
+
+    global _EXPERT_GTP_WEIGHT_REMAT_RS_GROUP
+    _EXPERT_GTP_WEIGHT_REMAT_RS_GROUP = None
 
     global _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS
     _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = None

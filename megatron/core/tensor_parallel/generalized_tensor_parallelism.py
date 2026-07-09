@@ -909,6 +909,18 @@ class GTPShardedParam(torch.nn.Parameter):
         """This rank's local shard shape, padding included."""
         return tuple(self.size())
 
+    @property
+    def rs_group(self):
+        """Communicator for the backward reduce-scatter, derived from THIS param's own
+        ``self.group``: with GTP_DECOUPLE_AGRS on it is the shadow comm built for that exact
+        group (same ranks + rank order); otherwise — a custom / manually-supplied group with no
+        shadow, or the knob off — it falls back to ``self.group`` (byte-identical to today).
+        Keying on the actual group (not is_routed_expert + global state) is what keeps custom
+        ProcessGroupCollection / manually-supplied GTP groups correct."""
+        from megatron.core import parallel_state as _ps
+
+        return _ps.get_gtp_rs_shadow_group(self.group)
+
     def get_padded_shard(self):
         """Return the local shard already containing its share of padding (identity)."""
         return self
@@ -1550,7 +1562,7 @@ class GTPShardedParam(torch.nn.Parameter):
             if len(wgrads) == 1:
                 nvtx_range_push(f"{nvtx_label}.gtp_rs")
                 out, handle = reduce_scatter_along_first_dim(
-                    wgrads[0], self.group, async_op=async_op, output=out_buffers[0]
+                    wgrads[0], self.rs_group, async_op=async_op, output=out_buffers[0]
                 )
                 nvtx_range_pop(f"{nvtx_label}.gtp_rs")
                 return [out], handle
@@ -1558,10 +1570,12 @@ class GTPShardedParam(torch.nn.Parameter):
             outputs = []
             nvtx_range_push(f"{nvtx_label}.batched_gtp_rs")
             with torch.distributed._coalescing_manager(
-                group=self.group, device=wgrads[0].device, async_ops=async_op
+                group=self.rs_group, device=wgrads[0].device, async_ops=async_op
             ) as cm:
                 for out_buffer, tensor in zip(out_buffers, wgrads):
-                    out, _ = reduce_scatter_along_first_dim(tensor, self.group, output=out_buffer)
+                    out, _ = reduce_scatter_along_first_dim(
+                        tensor, self.rs_group, output=out_buffer
+                    )
                     outputs.append(out)
             nvtx_range_pop(f"{nvtx_label}.batched_gtp_rs")
 

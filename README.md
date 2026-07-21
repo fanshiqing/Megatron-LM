@@ -1,214 +1,160 @@
-Megatron is a large, powerful transformer. This repo is for ongoing research on training large, powerful transformer language models at scale. Currently, we support model-parallel, multinode training of [GPT2](https://d4mucfpksywv.cloudfront.net/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) and [BERT](https://arxiv.org/pdf/1810.04805.pdf) in mixed precision. 
+<div align="center">
 
-Our codebase is capable of efficiently training a 72-layer, 8.3 Billion Parameter GPT2 Language model with 8-way model and 64-way data parallelism across 512 GPUs. We find that bigger language models are able to surpass current GPT2-1.5B wikitext perplexities in as little as 5 epochs of training.
+Megatron-LM and Megatron Core
+=============================
 
-For BERT training our repository trains BERT Large on 64 V100 GPUs in 3 days. We achieved a final language modeling perplexity of 3.15 and SQuAD F1-score of 90.7.
-<!--
-do we want to make any claims about GPT2 speed, convergence, or model release
--->
+<h4>GPU-optimized library for training transformer models at scale</h4>
 
-# Setup
-We officially support only python3.6.
+[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)
+[![version](https://img.shields.io/badge/release-0.15.0-green)](./CHANGELOG.md)
+[![license](https://img.shields.io/badge/license-Apache-blue)](./LICENSE)
 
-To use this repo please install the latest supported versions of PyTorch with GPU support. 
+<div align="left">
 
-Additionally, part of this codebase leverages tensorflow-cpu to (optionally) perform dataloading of TFRecords for BERT training. We recommend either utilizing the provided Dockerfile in [`./docker/`](./docker) or creating a virtual environment (to avoid breaking existing tf installations) and install our `requirements.txt`. 
+## About
 
-```
-python -m pip install virtualenv
-virtualenv bert_env
-source bert_env/bin/activate
-pip install -r requirements.txt
-```
+This repository contains two components: **Megatron-LM** and **Megatron Core**.
 
+**Megatron-LM** is a reference example that includes Megatron Core plus pre-configured training scripts, ideal for research teams, learning distributed training, and quick experimentation.
 
-# Usage
-We've provided 5 scripts that pretrain BERT and 3 scripts that pretrain GPT2. Save and load model checkpoints with `--save` and `--load`. Additionally we provide GPT2 scripts for interactive text generation and zero shot evaluation of GPT2 on wikitext and LAMBADA.
+**Megatron Core** is a composable library with GPU-optimized building blocks for custom training frameworks. It provides transformer building blocks, advanced parallelism strategies (TP, PP, DP, EP, and CP), mixed precision support (FP16, BF16, FP8, and FP4), and model architectures, ideal for framework developers and ML engineers building custom training pipelines.
 
-## BERT Pretraining
-`bash scripts/pretrain_bert.sh`
+**[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** provides bidirectional Hugging Face ↔ Megatron checkpoint conversion with production-ready recipes.
 
-This script runs single gpu BERT pretraining and is mainly for debugging purposes. The optimization arguments are set with 64-way distributed training in mind.
+## Getting Started
 
-To use this script place your `--train-data` in loose json format with one json per line. The text field of your json dictionaries should correspond to `--text-key`. 
+**Install from PyPI:**
 
-```
-python pretrain_bert.py \
-       --num-layers 24 \
-       --hidden-size 1024 \
-       --num-attention-heads 16 \
-       --batch-size 4 \
-       --seq-length 512 \
-       --max-preds-per-seq 80 \
-       --max-position-embeddings 512 \
-       --train-iters 1000000 \
-       --save checkpoints/bert_345m \
-       --load checkpoints/bert_345m \
-       --resume-dataloader \
-       --train-data wikipedia \
-       --lazy-loader \
-       --tokenizer-type BertWordPieceTokenizer \
-       --tokenizer-model-type bert-large-uncased \
-       --presplit-sentences \
-       --cache-dir cache \
-       --split 949,50,1 \
-       --distributed-backend nccl \
-       --lr 0.0001 \
-       --lr-decay-style linear \
-       --lr-decay-iters 990000 \
-       --weight-decay 1e-2 \
-       --clip-grad 1.0 \
-       --warmup .01 \
-       --fp16 \
-       --fp32-embedding
+```bash
+uv pip install megatron-core
 ```
 
-## GPT2 Pretraining
-`bash scripts/pretrain_gpt2.sh`
+**Or clone and install from source:**
 
-This script runs single gpu gpt2 pretraining and is mainly for debugging purposes. The optimization arguments are set with 64-way distributed training in mind. 
-
-It follows largely the same format as the previous script with a few notable differences: the `--tokenizer-type` has been switched to a `GPT2BPETokenizer`, the `--lr-decay-style` has been switched to cosine decay, and activation checkpointing has been turned on with `--checkpoint-activations` and `--checkpoint-num-layers` set to checkpoint every `1` layers.
-
-Additionally GPT2 uses a different parameter initialization from BERT designed for training deep residual networks. To train BERT with this initialization use `--deep-init`.
-
-```
-python pretrain_gpt2.py \
-       --num-layers 24 \
-       --hidden-size 1024 \
-       --num-attention-heads 16 \
-       --batch-size 8 \
-       --seq-length 1024 \
-       --max-position-embeddings 1024 \
-       --train-iters 320000 \
-       --save checkpoints/gpt2_345m \
-       --load checkpoints/gpt2_345m \
-       --resume-dataloader \
-       --train-data wikipedia \
-       --lazy-loader \
-       --tokenizer-type GPT2BPETokenizer \
-       --cache-dir cache \
-       --split 949,50,1 \
-       --distributed-backend nccl \
-       --lr 0.00015 \
-       --lr-decay-style cosine \
-       --weight-decay 1e-2 \
-       --clip-grad 1.0 \
-       --warmup .01 \
-       --checkpoint-activations \
-       --fp16
+```bash
+git clone https://github.com/NVIDIA/Megatron-LM.git
+cd Megatron-LM
+uv pip install -e .
 ```
 
-## GPT2 Text Generation
-`bash scripts/generate_text.sh`
+> **Note:** Building from source can use a lot of memory. If the build runs out of memory, limit parallel compilation jobs by setting `MAX_JOBS` (for example, `MAX_JOBS=4 uv pip install -e .`).
 
-Starts an interactive terminal session that generates text either conditionally or unconditionally depending on what the user enters into the prompt. Specify the model in the script by setting the `CHECKPOINT_PATH` variable and the appropriate model configuration. 
+For NVIDIA GPU Cloud (NGC) container setup and all installation options, review the **[Installation Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/install.html)**.
 
-The script is capable of greedy sampling, top-k, or top-p sampling as specified by the appropriate variables within the script.
+- **[Your First Training Run](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html)** - End-to-end training examples with data preparation
+- **[Parallelism Strategies](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html)** - Scale training across GPUs with TP, PP, DP, EP, and CP
+- **[Contribution Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)** - How to contribute to Megatron Core
 
-## GPT2 Evaluation
-We support 3 modes of GPT2 evaluation with [`./scripts/run_gpt2_eval.py`](./scripts/run_gpt2_eval.py): wikitext ppl evaluation, lambada cloze accuracy, large corpora ppl evaluation.
+# Latest News
 
-### Wikitext PPL evaluation
-For even comparison with prior works we evaluate wikitext perplexity on the word-level wikitext test dataset, which can be downloaded [here](https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-103-v1.zip), and appropriately compute perplexity given the change in tokens when using our subword tokenizer.
+- **[2026/05]** **[DeepSeek-V4 initial support](https://github.com/NVIDIA/Megatron-LM/issues/4468)** - Megatron Core's `dev` branch includes the initial DeepSeek-V4 implementation; Megatron Bridge provides [conversion, inference, and pretraining recipes](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/models/deepseek_v4).
+- **[2026/04]** **[Advancing Emerging Optimizers for Accelerated LLM Training with NVIDIA Megatron](https://developer.nvidia.com/blog/advancing-emerging-optimizers-for-accelerated-llm-training-with-nvidia-megatron/)** - Muon and other emerging optimizers are now supported in Megatron Core via the new **[Emerging-Optimizers](https://github.com/NVIDIA-NeMo/Emerging-Optimizers)** library.
+- **[2026/03]** **[Scalable Training of Mixture-of-Experts Models with Megatron Core](https://arxiv.org/abs/2603.07685)** - Technical report on scaling MoE training with integrated optimizations for memory, communication, and computation.
+- **[2026/03]** **[Implementing Falcon-H1 Hybrid Architecture in Megatron Core](https://developer.nvidia.com/blog/implementing-falcon-h1-hybrid-architecture-in-nvidia-megatron-core/)** - Technology Innovation Institute (TII) contributes Falcon-H1 hybrid transformer-Mamba architecture and BitNet ternary quantization support to Megatron Core.
+- **[2026/03]** **[Megatron Core Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/4003)** - Roadmap for upcoming Megatron Core features and improvements.
+- **[2026/03]** **Deprecating Python 3.10 support:** The upcoming 0.17.0 release drops Python 3.10 support. Downstream applications must raise their lower boundary to 3.12 to stay compatible with Megatron Core.
+- **[2026/01]** **[Dynamic Context Parallelism](https://developer.nvidia.com/blog/speeding-up-variable-length-training-with-dynamic-context-parallelism-and-nvidia-megatron-core/)** - Up to 1.48x speedup for variable-length sequence training with adaptive CP sizing.
+- **[2025/12]** **Megatron Core development has moved to GitHub.** All development and CI now happen in the open, and community contributions are welcome.
+- **[2025/10]** **[Megatron Dev Branch](https://github.com/NVIDIA/Megatron-LM/tree/dev)** - Early access branch with experimental features.
+- **[2025/10]** **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** - Bidirectional converter for interoperability between Hugging Face and Megatron checkpoints, featuring production-ready recipes for popular models.
+- **[2025/08]** **[Mixture of Experts (MoE) Q3–Q4 2025 Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729)** - Comprehensive roadmap for MoE features including DeepSeek-V3, Qwen3, advanced parallelism strategies, FP8 optimizations, and Blackwell performance enhancements.
+- **[2025/08]** **[GPT-OSS Model](https://github.com/NVIDIA/Megatron-LM/issues/1739)** - Megatron Core integrates advanced features including YaRN RoPE scaling, attention sinks, and custom activation functions.
+- **[2025/06]** **[Megatron MoE Model Zoo](https://github.com/yanring/Megatron-MoE-ModelZoo)** - Best practices and optimized configurations for training DeepSeek-V3, Mixtral, and Qwen3 MoE models with performance benchmarking and checkpoint conversion tools.
 
-We use the following command to run wikitext evaluation:
+[Previous News](docs/discussions/README.md#previous-news)
 
-```
-python scripts/run_gpt2_eval.py \
-  --model-parallel-size 1 \
-  --num-layers 24 \
-  --hidden-size 1024 \
-  --num-attention-heads 16 \
-  --model-path <gpt2_345_path> \
-  --data-path <wikitext_tokens_test_path> \
-  --batch-size 16 \
-  --cache-dir cache
-```
-
-### Lambada Cloze Accuracy
-To compute Lambada cloze accuracy (the accuracy of predicting the last token given the preceding tokens) we utilize a detokenized, processed version of the Lambada dataset we sourced from [here](https://github.com/cybertronai/bflm/blob/master/lambada_test.jsonl).
-
-We use the following command to run lambada evaluation:
+# Project Structure
 
 ```
-python scripts/run_gpt2_eval.py \
-  --model-parallel-size 1 \
-  --num-layers 24 \
-  --hidden-size 1024 \
-  --num-attention-heads 16 \
-  --model-path <gpt2_345_path> \
-  --data-path <lambada_test_path> \
-  --batch-size 16 \
-  --cloze-eval \
-  --cache-dir cache
+Megatron-LM/
+├── megatron/
+│   ├── core/                    # Megatron Core (kernels, parallelism, building blocks)
+│   │   ├── models/              # Transformer models
+│   │   ├── transformer/         # Transformer building blocks
+│   │   ├── tensor_parallel/     # Tensor parallelism
+│   │   ├── pipeline_parallel/   # Pipeline parallelism
+│   │   ├── distributed/         # Distributed training (FSDP, DDP)
+│   │   ├── optimizer/           # Optimizers
+│   │   ├── datasets/            # Dataset loaders
+│   │   ├── inference/           # Inference engines and server
+│   │   └── export/              # Model export (example: TensorRT-LLM)
+│   ├── training/                # Training scripts
+│   ├── legacy/                  # Legacy components
+│   ├── post_training/           # Post-training (quantization, distillation, pruning, etc.)
+│   └── rl/                      # Reinforcement learning (including RLHF)
+├── examples/                    # Ready-to-use training examples
+├── tools/                       # Utility tools
+├── tests/                       # Comprehensive test suite
+└── docs/                        # Documentation
 ```
 
-### Large Corpora PPL evaluation
-This functionality allows one to evaluate the gpt2 model on a loose json file. With the following command we evaluate the gpt2 model for 5000 iterations at a batch size of 16 on a webtext test data split. We recommend that the user presplit their dataset before training a model according to the procedure outlined [below](#partitioning-datasets-into-train-val-test).
+# Performance Benchmarking
 
+For the latest performance benchmarking results, refer to [NVIDIA Megatron Bridge Performance Summary](https://docs.nvidia.com/nemo/megatron-bridge/latest/performance-summary.html).
+
+The codebase efficiently trains models from 2B to 462B parameters across thousands of GPUs, achieving up to **47% Model FLOP Utilization (MFU)** on H100 clusters.
+
+![Model table](images/model_table.png)
+
+**Benchmark Configuration:**
+
+- **Vocabulary size**: 131,072 tokens
+- **Sequence length**: 4,096 tokens
+- **Model scaling**: Varied hidden size, attention heads, and layers to achieve target parameter counts
+- **Communication optimizations**: Fine-grained overlapping with DP (`--overlap-grad-reduce`, `--overlap-param-gather`), TP (`--tp-comm-overlap`), and PP (enabled by default)
+
+**Key Results:**
+
+- **6,144 H100 GPUs**: Successfully benchmarked 462B parameter model training.
+- **Superlinear scaling**: MFU increases from 41% to 47–48% with model size.
+- **End-to-end measurement**: Throughputs include all operations (data loading, optimizer steps, communication, and logging).
+- **Production ready**: Full training pipeline with checkpointing and fault tolerance.
+- *Note: Performance results measured without training to convergence*
+
+## Weak Scaling Results
+
+The weak scaled results show superlinear scaling (MFU increases from 41% for the smallest model considered to 47–48% for the largest models); this is because larger GEMMs have higher arithmetic intensity and are consequently more efficient to execute.
+
+![Weak scaling](images/weak_scaling.png)
+
+## Strong Scaling Results
+
+This test strong scales the standard GPT-3 model (slightly more than 175 billion parameters due to larger vocabulary size) from 96 H100 GPUs to 4,608 GPUs, using the same batch size of 1,152 sequences throughout. Communication becomes more exposed at larger scale, leading to a reduction in MFU from 47% to 42%.
+
+![Strong scaling](images/strong_scaling.png)
+
+# Roadmaps
+
+- **[2026 Q2 Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/4997)**
+- **[2026 Q2 MoE-Specific Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/4815)** [`dev` branch first developments]
+
+# Resources
+
+## Getting Help
+
+- 📖 **[Documentation](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)** - Official guides and API reference
+- 🐛 **[Issues](https://github.com/NVIDIA/Megatron-LM/issues)** - Bug reports and feature requests
+
+## Contributing
+
+Contributions are welcome. Ways to contribute:
+
+- 🐛 **Report bugs** - Help improve reliability
+- 💡 **Suggest features** - Shape the future of Megatron Core
+- 📝 **Improve docs** - Make Megatron Core more accessible
+- 🔧 **Submit PRs** - Contribute code improvements
+
+**→ [Contributing Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)**
+
+## Citation
+
+If you use Megatron in your research or project, use the following citation:
+
+```bibtex
+@article{megatron-lm,
+  title={Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism},
+  author={Shoeybi, Mohammad and Patwary, Mostofa and Puri, Raul and LeGresley, Patrick and Casper, Jared and Catanzaro, Bryan},
+  journal={arXiv preprint arXiv:1909.08053},
+  year={2019}
+}
 ```
-python scripts/run_gpt2_eval.py \
-  --model-parallel-size 1 \
-  --num-layers 24 \
-  --hidden-size 1024 \
-  --num-attention-heads 16 \
-  --model-path <gpt2_345_path> \
-  --data-path <webtext_test_path> \
-  --batch-size 16 \
-  --eval-iters 5000 \
-  --webtext-eval \
-  --cache-dir cache
-```
-
-## Distributed BERT or GPT2 Pretraining
-`bash scripts/pretrain_bert_distributed.sh` or `bash scripts/pretrain_gpt2_distributed.sh`
-
-To use these scripts, follow the same data preparation procedure as in earlier sections. This script uses the pytorch distributed launcher to launch distributed training. As such, multinode training can be achieved by properly setting environment variables for the `env://` init method. See the official pytorch [documentation](https://pytorch.org/docs/stable/distributed.html#launch-utility) for further description of these [environment variables](https://pytorch.org/docs/stable/distributed.html#environment-variable-initialization). By default multinode training uses the nccl distributed backend.
-
-## Model Parallel BERT or GPT2 Pretraining
-`bash scripts/pretrain_bert_model_parallel.sh` or `bash scripts/pretrain_gpt2_model_parallel.sh`
-
-These scripts build upon the distributed training scripts and are identical in setup. They differ in use of the `--model-parallel-size` flag. For model parallelism of 2 and a world size of 8, the scripts will launch training with 4-way distributed data parallelism and 2-way model parallelism.
-
-We note that we have experimented with multiple distributed data parallel implementations: a simple one of our own which performs gradient all-reduce at the end of back propagation step, and torch's distributed data parallel wrapper which overlaps gradient reduction with back propagation computation. To switch between these two options toggle the `USE_TORCH_DDP` flag (the default is set to `False` and uses our DDP implementation) at the top of `pretrain_bert.py` and `pretrain_gpt2.py`. We find that torch distributed data parallelism is more efficient at larger model parallel sizes. For example, for the 8.3 billion parameters model running on 512 GPUs, the scaling increases from 60% to 74% when torch's distributed data parallel is used. However, the overlapping method requires more memory and for some configurations (e.g., 2.5 billion parameters using 2-way model parallel and 1.2 billion parameters with no model parallel) can make the overall training slower as a result. We empirically found that using a smaller model in those cases improves the training time.
-
-## Distributed BERT Pretraining with TFRecords
-`bash scripts/pretrain_bert_tfrecords_distributed.sh`
-
-This script takes advantage of TensorFlow BERT's [`create_pretraining.py`](https://github.com/NVIDIA/DeepLearningExamples/blob/master/TensorFlow/LanguageModeling/BERT/create_pretraining_data.py) script to pre-cache the dataset in the TFRecord format. To convert the data to pytorch tensors we use a `TFRecordDataset` and tensorflow eager mode to turn the TFRecords into numpy matrices before loading them into pytorch gpu tensors. This greatly reduces the overhead of dataprocessing and speeds up training. Pass a whitespace-separated list of TFRecord paths to `--train-data` and enable the `--use-tfrecords` flag. Multinode training can be achieved as described in the [previous section](#distributed-bert-pretraining).
-
-## Train Custom Sentence Piece Tokenizer and Pretrain BERT
-`bash scripts/pretrain_bert_sentencepiece.sh`
-
-This script runs BERT pretraining with a `sentencepiece` tokenizer. If no sentencepiece tokenizer exists at `--tokenizer-path` one will be trained automatically. The sentencepiece tokenizer can be used with the previous scripts (NOTE: sentencepiece training can only happen during single gpu pretraining). `<--tokenizer-path>.vocab` can be used with [`create_pretraining_data.py`](https://github.com/NVIDIA/DeepLearningExamples/blob/master/TensorFlow/LanguageModeling/BERT/create_pretraining_data.py) to make a TFRecord dataset with the given tokenization.
-
-
-# Data sets
-We do not host any datasets for GPT2 or BERT training, however, we detail their collection so that our results may be reproduced.
-
-## Collecting Wikipedia Training Data
-We recommend following the wikipedia data extraction process specified by google research: "the recommended pre-processing is to download [the latest dump](https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2), extract the text with [WikiExtractor.py](https://github.com/attardi/wikiextractor), and then apply any necessary cleanup to convert it into plain text." 
-
-We recommend using the `--json` argument when using WikiExtractor, which will dump the wikipedia data into loose json format (one json per line), making it more manageable and readily consumable by our codebase. We recommend further preprocessing this json dataset by preprocessing the dataset with nltk punctuation standardization, and presplitting each document into newline separated sentences. This can be done with the provided script `./scripts/presplit_sentences_json.py` and will allow for faster data processing during training time. Pretraining with presplit data should be run with the `--presplit-sentences` flag as shown above. (Note that if you'd like to use wikipedia data for GPT2 training you should still clean it with nltk/spacy/ftfy, but do not split it into newline seperated sentences)
-
-Once the json dataset is ready make sure to set the path in line 27 of `data_utils/corpora.py`.
-
-If your system is memory limited we also recommend running pretraining with the `--lazy-loader` argument as we've done. After preprocessing the dataset once, this will allow the dataset to be lazily loaded from disk, as opposed to storing it in memory. Make sure to run the code once on a 
-
-## Collecting GPT2 Webtext Data
-We utilize the publicly available [OpenWebText](https://github.com/eukaryote31/openwebtext) library from [jcpeterson](https://github.com/jcpeterson/openwebtext) and [eukaryote31's](https://github.com/eukaryote31/openwebtext) work to download urls. We then filtered, cleaned, and deduplicated all downloaded content according to the procedure described in our [openwebtext](./openwebtext) directory. For reddit URLS corresponding to content upto october 2018 we arrived at approximately 37GB of content.
-
-We recommend creating an alias for this dataset as described below.
-
-## Aliasing datasets with corpora.py
-As mentioned in the previous Wikipedia data section we recommend aliasing datasets with human readable names (eg. `--train-data wikipedia`). This helps avoid forgetting arguments when submitting jobs, and allows one to combine datasets that would otherwise require different commandline options/data structures.
-
-Examples of how to create these dataset objects can be found in [`./data_utils/corpora.py`](./data_utils/corpora.py). We recommend that the objects inherit from or adhere to the interface laid out by `torch.utils.data.Dataset` objects.
-
-Any created datasets should be then added to the `NAMED_CORPORA` dictionary object in [`./data_utils/corpora.py`](./data_utils/corpora.py). At runtime one can specify one or more corpora from the commandline with `--train-data corpus1 corpus2 corpus3`, `--valid-data corpus1 corpus2 corpus3`, or `--test-data ...`.
-
-## Partitioning datasets into Train/Val/Test
-We support multiple ways to partition corpora into train/val/test splits. By specifying a `--split 95,5` commandline argument, the corpora specified by `--train-data` will have it's documents split proportionally into a 95%, 5% train/val split. The split is performed lazily on the fly and is efficient and deterministic from run to run given the same `--seed`. Note that if `--valid-data` or `--test-data` is specified then the train data will still be split accordingly, but `--valid-data`/`--test-data` will still be used as the validation/test source.
-
-We do realize that this method, while effective, introduces noise into the development process, since different seeds will change the dataset and outcome. To have fixed training/validation/test sets across all your runs please utilize our script [`./scripts/split_json.py`](./scripts/split_json.py)

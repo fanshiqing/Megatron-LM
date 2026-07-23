@@ -245,7 +245,8 @@ At iter-0 you'll see one rank-0 log line confirming the active config:
 
 ```
 GTP_remat enabled. GTPRematConfig(pad_for_alignment=16, check_param_states=False,
-  weight_prefetch=True, async_reduction=True, calculate_per_token_loss=False)
+  weight_prefetch=True, async_reduction=True, calculate_per_token_loss=False,
+  cross_cg_overlap=True, graph_wgrad_ring_size=2)
 ```
 
 ### 2.4 Tuning knobs
@@ -258,10 +259,17 @@ update_gtp_config(
     weight_prefetch=True,         # Disable to debug the cold-start path
     async_reduction=True,         # Whether to perform GTP_remat gradient reduction asynchronously
     calculate_per_token_loss=False,  # Mirror config.calculate_per_token_loss (SUM vs MEAN RS)
+    cross_cg_overlap=True,        # Overlap GTP RS across local CUDA-graph boundaries
+    graph_wgrad_ring_size=2,      # Persistent wgrad slots per graph scheduling domain
 )
 ```
 
 `training.py` auto-tunes `pad_for_alignment` based on the quantization recipe (`--fp4`, `--fp8-recipe=mxfp8`, etc.) before model construction. The other knobs are usually left at defaults.
+
+GTP backward reduce-scatter overlap across local CUDA-graph boundaries is enabled by default.
+Pass `--disable-gtp-local-cg-backward-rs-overlap` to drain reduce-scatter and its gradient
+finalization before releasing the next local graph. This fallback is useful for correctness
+comparisons and debugging; it gives up cross-graph communication overlap.
 
 > **CUDA-graph warmup under GTP_remat.** When CUDA graphs are enabled, GTP_remat forces a minimum of **2** per-graph warmup steps regardless of `--cuda-graph-warmup-steps` (e.g. a user-set `0` is bumped to `2`): the first warmup builds the weight-prefetch chain and the second exercises the prefetch path before capture.
 

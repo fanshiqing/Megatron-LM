@@ -734,7 +734,12 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             else:
                 grad_weight = None
         else:
-            grad_weight = grad_output.t().matmul(total_input)
+            if ctx.gtp_remat_size > 1 and sharded_weight.use_zero_copy_wgrad(grad_output.dtype):
+                # GTP: write the wgrad straight into the reduce-scatter send buffer.
+                grad_weight = sharded_weight.get_wgrad_tensor()
+                torch.matmul(grad_output.t(), total_input, out=grad_weight)
+            else:
+                grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
         # GTP: reduce-scatter wgrad

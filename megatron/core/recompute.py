@@ -33,6 +33,7 @@ def checkpointed_forward(
     extract_layer_indices: Optional[Set[int]] = None,
     layer_offset: int = 0,
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
+    packed_sequence_cp_metadata: object | None = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -44,6 +45,10 @@ def checkpointed_forward(
             pipeline stage. Used to convert local layer indices to
             global indices when checking extract_layer_indices.
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
+        packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
+
+        The layout state and packed-sequence CP metadata are used inside the checkpointed function
+        and are repeated during recomputation.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -120,7 +125,13 @@ def checkpointed_forward(
                     else:  # MambaLayer (HybridStack `M` slot)
                         for k in ("context", "context_mask", "attention_bias", "padding_mask"):
                             layer_kwargs.pop(k, None)
-                        hidden_states = layer(**layer_kwargs)
+                        if packed_sequence_cp_metadata is None:
+                            hidden_states = layer(**layer_kwargs)
+                        else:
+                            hidden_states = layer(
+                                packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                                **layer_kwargs,
+                            )
                         context = None
 
                 # Some layer paths may still return a tuple (defensive).

@@ -26,6 +26,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as Layer
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
+from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.identity_op import IdentityOp
@@ -109,6 +110,9 @@ class HybridStack(MegatronModule):
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
+        self._linear_cp_is_chunkwise = (
+            self.config.linear_cp_mode == "chunkwise" and self.cp_group.size() > 1
+        )
 
         # Required for pipeline parallel schedules
         self.input_tensor = None
@@ -119,6 +123,9 @@ class HybridStack(MegatronModule):
             "--hybrid-layer-pattern by HybridModel."
         )
         self.layer_type_list = layer_type_list
+        self._has_linear_layer_with_chunkwise_cp = (
+            self._linear_cp_is_chunkwise and LayerSymbols.MAMBA in self.layer_type_list
+        )
         self._cp_layout_manager = None
         if self.cp_group.size() > 1:
             layer_layouts = tuple(
@@ -321,9 +328,24 @@ class HybridStack(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        if self._has_linear_layer_with_chunkwise_cp and padding_mask is not None:
+            raise NotImplementedError(
+                "Hybrid chunkwise context parallelism does not support padding masks."
+            )
+
         cp_layout_state = None
         if self._cp_layout_manager is not None:
             cp_layout_state = self._cp_layout_manager.build_forward_state(packed_seq_params)
+
+        packed_sequence_cp_metadata = None
+        if self._has_linear_layer_with_chunkwise_cp and packed_seq_params is not None:
+            if packed_seq_params.seq_idx is None:
+                raise ValueError("Packed chunkwise CP requires packed_seq_params.seq_idx")
+            packed_sequence_cp_metadata = build_packed_sequence_cp_metadata(
+                packed_seq_params.seq_idx,
+                cp_rank=self.cp_group.rank(),
+                cp_size=self.cp_group.size(),
+            )
 
         if not self.pre_process:
             # See set_input_tensor()
@@ -394,6 +416,7 @@ class HybridStack(MegatronModule):
                     padding_mask=padding_mask,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
+                    packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                 )
             else:
                 for layer_index, layer in enumerate(self.layers):
@@ -418,12 +441,24 @@ class HybridStack(MegatronModule):
                                 padding_mask=padding_mask,
                             )
                         else:  # MambaLayer, Expert, or MLP
-                            hidden_states = layer(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                inference_context=inference_context,
-                                packed_seq_params=layer_packed_seq_params,
-                            )
+                            if (
+                                self.layer_type_list[layer_index] == LayerSymbols.MAMBA
+                                and packed_sequence_cp_metadata is not None
+                            ):
+                                hidden_states = layer(
+                                    hidden_states=hidden_states,
+                                    attention_mask=attention_mask,
+                                    inference_context=inference_context,
+                                    packed_seq_params=layer_packed_seq_params,
+                                    packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                                )
+                            else:
+                                hidden_states = layer(
+                                    hidden_states=hidden_states,
+                                    attention_mask=attention_mask,
+                                    inference_context=inference_context,
+                                    packed_seq_params=layer_packed_seq_params,
+                                )
 
                     # The attention layer (currently a simplified transformer layer)
                     # outputs a tuple of (hidden_states, context). Context is intended

@@ -458,7 +458,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                     f"Muon QKV split shape mismatch on the whole matrix: "
                     f"rows={grad.size(0)}, qkv_split_shapes={qkv_split_shapes} "
                     f"(sum {qkv_rows}). The row count is decided by the optimizer's qkv "
-                    f"tagging loop (qkv_rows_after_gtp_gather), not here."
+                    f"tagging loop in _get_megatron_emerging_optimizer, not here."
                 )
             num_query_groups = grad.size(0) // qkv_rows
             cols = grad.size(-1)

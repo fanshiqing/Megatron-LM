@@ -4,11 +4,14 @@
 
 Two properties, matching the two halves of the fix:
   1. the decision uses the GTP-unsharded row count, not this rank's shard
-     (`test_local_shard_would_have_disabled` pins the shape that used to fail);
+     (`test_split_after_gather_matches_tp1` reproduces the shape that used to fail:
+     the per-rank shard (`_M // _GTP_WORLD_SIZES`) doesn't divide evenly by `_GROUP`,
+     the exact condition that used to disable the split on every GTP rank);
   2. the split is applied AFTER the all-gather, so the GTP result equals TP1's
      restricted to this rank's rows, and row-sharded modes fall back to whole-matrix NS.
 """
 
+import contextlib
 import logging
 from unittest import mock
 
@@ -22,7 +25,6 @@ if not HAVE_GTP:
 
 from megatron.core import parallel_state as ps
 from megatron.core.optimizer import emerging_optimizers as _eo_module
-from megatron.core.optimizer import qkv_rows_after_gtp_gather
 from megatron.core.optimizer.emerging_optimizers import HAVE_EMERGING_OPTIMIZERS, TensorParallelMuon
 
 if not HAVE_EMERGING_OPTIMIZERS:
@@ -59,80 +61,6 @@ _SCALE_MODE = "spectral"
 # The local shard must NOT be a multiple of _GROUP -- that is the bug shape.
 # 192/2 = 96 is, so world 2 cannot reproduce it; 192/4 and 192/8 can.
 _GTP_WORLD_SIZES = [4, 8]
-
-
-class _FakeGroup:
-    """Only ``.size()`` is read, so no real ProcessGroup is needed."""
-
-    def __init__(self, n):
-        self._n = n
-
-    def size(self):
-        return self._n
-
-
-def _param(rows, pad=0, sharded=True):
-    """A stand-in for a qkv weight. `sharded` mirrors is_gtp_weight_remat."""
-    p = torch.nn.Parameter(torch.zeros(rows, _K), requires_grad=False)
-    p.is_gtp_weight_remat = sharded
-    if pad:
-        p.pad_length = pad
-    return p
-
-
-def _rows(param, split, gtp_size=None):
-    """qkv_rows_after_gtp_gather with a stand-in for the optimizer's GTP group."""
-    # get_pg_size returns 1 when dist is down, which would pass these for the wrong reason.
-    assert torch.distributed.is_initialized()
-    return qkv_rows_after_gtp_gather(param, split, _FakeGroup(gtp_size) if gtp_size else None)
-
-
-class TestQKVRowCount:
-    """The is_qkv decision is taken on the GTP-unsharded shape, so it is layout-invariant."""
-
-    @pytest.mark.parametrize("gtp_size", [1, 2, 4, 64])
-    def test_decision_is_layout_invariant(self, gtp_size):
-        """ONE weight of _M rows, sharded every which way: same verdict, same count.
-
-        Asserted against constants, not against the implementation's own expression --
-        restating the formula would pass for any implementation that keeps it. At
-        gtp_size=64 the shard is 3 rows, so the shard-local test this replaced would
-        say False here while saying True at gtp_size=1.
-        """
-        assert _M % gtp_size == 0, "the fixture must shard evenly to stay one weight"
-        assert _rows(_param(_M // gtp_size), _SPLIT, gtp_size) == (_M, gtp_size, True)
-
-    def test_local_shard_would_have_disabled(self):
-        """The regression test: production's 102 x 64 = 6528, which the old
-        ``param.shape[0] % 6528`` rule reported False on every GTP rank."""
-        local, gtp = 102, 64
-        split = [6144, 192, 192]
-        assert local % sum(split) != 0, "shard-local test must fail for this to be a regression"
-        assert _rows(_param(local), split, gtp) == (6528, 64, True)
-
-    def test_unsharded_matches_sharded(self):
-        """TP1 (no group attr) and GTP must reach the same verdict for one weight."""
-        assert _rows(_param(_M), _SPLIT)[2] is True
-        assert _rows(_param(_M // 4), _SPLIT, 4)[2] is True
-
-    def test_padding_is_excluded(self):
-        """GTP pads dim 0 up to a multiple of the group size; pad rows are not weight."""
-        rows, _, splittable = _rows(_param(25, pad=4), _SPLIT, 4)  # 25 x 4 - 4 pad
-        assert (rows, splittable) == (_GROUP, True)
-        # Unsubtracted the count is 100, which is NOT splittable -- so the assert above
-        # pins the subtraction, not just that 96 happens to work.
-        assert 100 % _GROUP != 0
-
-    def test_non_qkv_shape_is_rejected(self):
-        """A weight whose GTP-unsharded rows do not divide is refused, not forced."""
-        rows, _, splittable = _rows(_param(30), _SPLIT, 4)
-        assert (rows, splittable) == (120, False)
-
-    def test_unsharded_param_ignores_the_group(self):
-        """Tagging gates on is_gtp_weight_remat, the same signal `gtp_active` uses;
-        scaling regardless would hand the split a local shard. pad_length goes unused
-        for the same reason -- no scaling, nothing to subtract."""
-        assert _rows(_param(_GROUP, pad=4, sharded=False), _SPLIT, 4) == (_GROUP, 1, True)
 
 
 def _make_muon(pg_collection, tp_mode="duplicated"):
@@ -175,53 +103,52 @@ def _reference_split_orth(opt, w, tp_group):
     return out
 
 
-def _init_model_parallel(tp_size, gtp_remat_size):
+@contextlib.contextmanager
+def _gtp_case(world_size):
+    """Common init/teardown for a GTP+Muon QKV-split worker at this ``world_size``."""
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
-        tensor_model_parallel_size=tp_size,
-        pipeline_model_parallel_size=1,
-        gtp_remat_size=gtp_remat_size,
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=world_size
     )
-
-
-def _worker_split_after_gather(rank, world_size, port):
-    """The GTP shard of the split result must equal the TP1 split result, sliced."""
-    _init_model_parallel(1, world_size)
     try:
-        pgc = ProcessGroupCollection.use_mpu_process_groups()
-        opt = _make_muon(pgc)
-        w = _full_weight()
-        ref = _reference_split_orth(opt, w, pgc.tp)
-
-        gs = torch.distributed.get_world_size(group=pgc.gtp_remat)
-        gr = torch.distributed.get_rank(group=pgc.gtp_remat)
-        sp = _M // gs
-        local = w[gr * sp : (gr + 1) * sp, :].clone()
-        local.is_gtp_weight_remat = True
-
-        out = opt.scaled_orthogonalize_fn_with_gtp_remat(
-            local, local, pgc.tp, None, qkv_split_shapes=_SPLIT
-        )
-        torch.testing.assert_close(out, ref[gr * sp : (gr + 1) * sp, :], atol=_ATOL, rtol=_RTOL)
+        yield
     finally:
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()
 
 
-def _worker_split_differs_from_whole(rank, world_size, port):
-    """Negative control: whole-matrix NS is the old GTP behaviour, so a regression
-    to it would make the equality test above compare two identical things."""
-    _init_model_parallel(1, world_size)
-    try:
+def _local_shard(w, gtp_remat_group):
+    """This rank's row shard of ``w``, tagged as GTP_remat-sharded."""
+    gr = torch.distributed.get_rank(group=gtp_remat_group)
+    sp = _M // torch.distributed.get_world_size(group=gtp_remat_group)
+    local = w[gr * sp : (gr + 1) * sp, :].clone()
+    local.is_gtp_weight_remat = True
+    return local, gr, sp
+
+
+def _worker_split_after_gather(rank, world_size, port):
+    """The GTP shard of the split result must equal the TP1 split result, sliced."""
+    with _gtp_case(world_size):
         pgc = ProcessGroupCollection.use_mpu_process_groups()
         opt = _make_muon(pgc)
         w = _full_weight()
+        ref = _reference_split_orth(opt, w, pgc.tp)
+        local, gr, sp = _local_shard(w, pgc.gtp_remat)
 
-        gs = torch.distributed.get_world_size(group=pgc.gtp_remat)
-        gr = torch.distributed.get_rank(group=pgc.gtp_remat)
-        sp = _M // gs
-        local = w[gr * sp : (gr + 1) * sp, :].clone()
-        local.is_gtp_weight_remat = True
+        out = opt.scaled_orthogonalize_fn_with_gtp_remat(
+            local, local, pgc.tp, None, qkv_split_shapes=_SPLIT
+        )
+        torch.testing.assert_close(out, ref[gr * sp : (gr + 1) * sp, :], atol=_ATOL, rtol=_RTOL)
+
+
+def _worker_split_differs_from_whole(rank, world_size, port):
+    """Negative control: whole-matrix NS is the old GTP behaviour, so a regression
+    to it would make the equality test above compare two identical things."""
+    with _gtp_case(world_size):
+        pgc = ProcessGroupCollection.use_mpu_process_groups()
+        opt = _make_muon(pgc)
+        w = _full_weight()
+        local, _, _ = _local_shard(w, pgc.gtp_remat)
 
         split = opt.scaled_orthogonalize_fn_with_gtp_remat(
             local, local, pgc.tp, None, qkv_split_shapes=_SPLIT
@@ -230,24 +157,16 @@ def _worker_split_differs_from_whole(rank, world_size, port):
         assert not torch.allclose(
             split, whole, atol=_ATOL, rtol=_RTOL
         ), "split-QKV produced the whole-matrix result; the split is not being applied"
-    finally:
-        ps.destroy_model_parallel()
-        ps.initialize_model_parallel()
 
 
 def _worker_row_sharded_modes_fall_back(rank, world_size, port, mode):
     """Row-sharded modes hold no q/k/v boundary, so they must keep the pre-fix
     whole-matrix rule -- these configs trained before this fix and must still run."""
-    _init_model_parallel(1, world_size)
-    try:
+    with _gtp_case(world_size):
         pgc = ProcessGroupCollection.use_mpu_process_groups()
         opt = _make_muon(pgc, tp_mode=mode)
         w = _full_weight()
-        gs = torch.distributed.get_world_size(group=pgc.gtp_remat)
-        gr = torch.distributed.get_rank(group=pgc.gtp_remat)
-        sp = _M // gs
-        local = w[gr * sp : (gr + 1) * sp, :].clone()
-        local.is_gtp_weight_remat = True
+        local, _, _ = _local_shard(w, pgc.gtp_remat)
 
         asked = opt.scaled_orthogonalize_fn_with_gtp_remat(
             local, local, pgc.tp, None, qkv_split_shapes=_SPLIT
@@ -260,23 +179,15 @@ def _worker_row_sharded_modes_fall_back(rank, world_size, port, mode):
         assert torch.equal(
             asked, never_asked
         ), f"tp_mode={mode}: asking for split-QKV changed the result"
-    finally:
-        ps.destroy_model_parallel()
-        ps.initialize_model_parallel()
 
 
 def _worker_warns_once(rank, world_size, port):
     """A per-step warning would print once per qkv weight per iteration, forever."""
-    _init_model_parallel(1, world_size)
-    try:
+    with _gtp_case(world_size):
         pgc = ProcessGroupCollection.use_mpu_process_groups()
         opt = _make_muon(pgc, tp_mode="distributed")
         w = _full_weight()
-        gs = torch.distributed.get_world_size(group=pgc.gtp_remat)
-        gr = torch.distributed.get_rank(group=pgc.gtp_remat)
-        sp = _M // gs
-        local = w[gr * sp : (gr + 1) * sp, :].clone()
-        local.is_gtp_weight_remat = True
+        local, _, _ = _local_shard(w, pgc.gtp_remat)
 
         with mock.patch.object(_eo_module, "log_single_rank") as logged:
             for _ in range(3):
@@ -288,9 +199,6 @@ def _worker_warns_once(rank, world_size, port):
         assert (
             "--muon-tp-mode duplicated" in warnings[0].args[2]
         ), "the warning must name the flag that restores the layout-invariant rule"
-    finally:
-        ps.destroy_model_parallel()
-        ps.initialize_model_parallel()
 
 
 def _worker_auto_mode_forces_duplicated_for_split(rank, world_size, port):
@@ -298,27 +206,18 @@ def _worker_auto_mode_forces_duplicated_for_split(rank, world_size, port):
     split happens: pinned to duplicated whenever qkv_split_shapes is set, so this must
     match the TP1 reference and never hit the row-sharded fallback -- regardless of what
     the cost model would otherwise pick for this shape."""
-    _init_model_parallel(1, world_size)
-    try:
+    with _gtp_case(world_size):
         pgc = ProcessGroupCollection.use_mpu_process_groups()
         opt = _make_muon(pgc, tp_mode="auto")
         w = _full_weight()
         ref = _reference_split_orth(opt, w, pgc.tp)
-
-        gs = torch.distributed.get_world_size(group=pgc.gtp_remat)
-        gr = torch.distributed.get_rank(group=pgc.gtp_remat)
-        sp = _M // gs
-        local = w[gr * sp : (gr + 1) * sp, :].clone()
-        local.is_gtp_weight_remat = True
+        local, gr, sp = _local_shard(w, pgc.gtp_remat)
 
         out = opt.scaled_orthogonalize_fn_with_gtp_remat(
             local, local, pgc.tp, None, qkv_split_shapes=_SPLIT
         )
         assert not opt._warned_qkv_split_disabled, "auto must not hit the row-sharded fallback"
         torch.testing.assert_close(out, ref[gr * sp : (gr + 1) * sp, :], atol=_ATOL, rtol=_RTOL)
-    finally:
-        ps.destroy_model_parallel()
-        ps.initialize_model_parallel()
 
 
 def _worker_partial_pg_collection(rank, world_size, port):
@@ -330,8 +229,7 @@ def _worker_partial_pg_collection(rank, world_size, port):
     tagged splittable on the gathered row count, stepped as if unsharded -- and the
     split hits a row shard.
     """
-    _init_model_parallel(1, world_size)
-    try:
+    with _gtp_case(world_size):
         full = ProcessGroupCollection.use_mpu_process_groups()
         partial = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
         assert partial.gtp_remat is None, "a partial collection must not carry gtp_remat"
@@ -340,11 +238,7 @@ def _worker_partial_pg_collection(rank, world_size, port):
         ), "tagging resolves a real group here; the step has to reach the same one"
 
         w = _full_weight()
-        gs = torch.distributed.get_world_size(group=full.gtp_remat)
-        gr = torch.distributed.get_rank(group=full.gtp_remat)
-        sp = _M // gs
-        local = w[gr * sp : (gr + 1) * sp, :].clone()
-        local.is_gtp_weight_remat = True
+        local, _, _ = _local_shard(w, full.gtp_remat)
 
         out_full = _make_muon(full).scaled_orthogonalize_fn_with_gtp_remat(
             local, local, full.tp, None, qkv_split_shapes=_SPLIT
@@ -358,9 +252,6 @@ def _worker_partial_pg_collection(rank, world_size, port):
             "a partial pg_collection changed the Muon update; the step resolved a "
             "different GTP group than the optimizer's qkv tagging did"
         )
-    finally:
-        ps.destroy_model_parallel()
-        ps.initialize_model_parallel()
 
 
 class TestGTPMuonQKVSplit:

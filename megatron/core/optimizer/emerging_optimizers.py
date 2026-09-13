@@ -443,10 +443,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 )
 
         def scaled_orthogonalize_fn_with_qkv_split(grad):
-            """Orthogonalize `grad`, splitting [q|k|v] first when asked.
+            """Orthogonalize `grad`, splitting [q|k|v] first when `qkv_split_shapes` is not None.
 
-            `grad` is always the WHOLE matrix -- GTP is inactive, or the caller
-            has already gathered. A row shard would cut q/k/v mid-boundary.
+            `grad` is always GTP-unsharded -- GTP is inactive, or the caller has already
+            gathered. A GTP row shard would cut q/k/v mid-boundary.
             """
             if qkv_split_shapes is None:
                 return self.scaled_orthogonalize_fn(
@@ -455,10 +455,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             qkv_rows = sum(qkv_split_shapes)
             if grad.size(0) % qkv_rows != 0:
                 raise RuntimeError(
-                    f"Muon QKV split shape mismatch on the whole matrix: "
-                    f"rows={grad.size(0)}, qkv_split_shapes={qkv_split_shapes} "
-                    f"(sum {qkv_rows}). The row count is decided by the optimizer's qkv "
-                    f"tagging loop in _get_megatron_emerging_optimizer, not here."
+                    f"Muon QKV split shape mismatch: grad_shape={tuple(grad.shape)}, "
+                    f"split_shapes={qkv_split_shapes}"
                 )
             num_query_groups = grad.size(0) // qkv_rows
             cols = grad.size(-1)

@@ -6,11 +6,15 @@ Test groups
 -----------
 TestMoEEGTPCorrectness  - EGTP_remat MoE loss trajectory matches baseline (no-EGTP_remat) over 10
                           training steps using MXFP8 and Nemotron3-Super MoE hyperparameters.
+TestMoEEGTPPrecisionOverride
+                        - EGTP_remat grouped experts that a te-precision-config override keeps
+                          off the op-fuser path must still complete backward.
 """
 
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
@@ -328,6 +332,191 @@ def _worker_expert_bias_gtp_inclusive(rank, world_size, port):
         ), f"tp_dp_cp must keep expert_bias identical across gtp_remat peers, got {diff_included}"
 
 
+# ---------------------------------------------------------------------------
+# EGTP_remat grouped experts kept unfused by a te-precision-config override
+# ---------------------------------------------------------------------------
+
+# The production matcher from te_quant_mxfp8.cfg / bf16_overrides.yaml, verbatim.
+MTP_BF16_PATTERN = "*mtp.layers.*"
+# A module path the matcher hits, so the override is resolved exactly as it is in production
+# (by module path) without building a full MTP stack.
+MTP_LAYER_NAME = "mtp.layers.0.mlp"
+
+
+def _bf16_override_recipe():
+    """The `mtp_bf16` matcher: force anything under `mtp.layers.` to high precision."""
+    from megatron.core.quantization.quant_config import RecipeConfig
+
+    return RecipeConfig.from_config_dict(
+        {
+            "configs": {
+                "bf16": {
+                    "transformer_engine_config_type": "TEQuantizationParams",
+                    "training_recipe": {},
+                }
+            },
+            "matchers": {
+                "mtp_bf16": {
+                    "type": "glob",
+                    "enabled": True,
+                    "pattern": MTP_BF16_PATTERN,
+                    "config": "bf16",
+                }
+            },
+        }
+    )
+
+
+def _worker_egtp_precision_override_backward(rank, world_size, port, egtp_remat_size):
+    """EGTP_remat-sharded grouped experts that a precision override keeps unfused.
+
+    A ``--te-precision-config-file`` matcher that forces a grouped-expert layer to high
+    precision (in production: ``pattern: "*mtp.layers.*"`` against an MXFP8 run) drives
+    ``TEGroupedMLP._with_fused_impl`` to False, so those experts run on the stock
+    ``te.pytorch.GroupedLinear`` module instead of the op fuser. That module is still
+    constructed with ``use_grouped_tensor=True``, because ``use_transformer_engine_op_fuser``
+    force-enables ``moe_use_grouped_tensor`` for the whole config.
+
+    TE's grouped-tensor forward materializes a DistributedWeight into a plain gathered
+    tensor before it builds the wgrad-accumulation closures, and -- unlike its
+    split-quantize sibling, which branches on ``is_dist_weight`` and reads
+    ``origin_weights[i].grad_buffer`` -- it closes over the materialized tensor:
+
+        ctx.main_grad_funcs = [lambda j=i: weights[j].main_grad for i in range(len(weights))]
+
+    so backward raises ``AttributeError: 'Tensor' object has no attribute 'main_grad'``.
+
+    Both ingredients are required. At ``egtp_remat_size=1`` the expert weights are ordinary
+    Parameters, nothing is materialized, and the same closure reads a real ``main_grad`` --
+    which is why the benchmark scripts, which default to EGTP_remat=1, never hit this.
+    """
+    from megatron.core import parallel_state as ps
+    from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.moe.experts import TEGroupedMLP
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    HIDDEN_OVERRIDE = 512
+    FFN_HIDDEN_OVERRIDE = 256
+    NUM_EXPERTS_OVERRIDE = 4
+    SEQ_OVERRIDE = 16
+    BATCH_OVERRIDE = 1
+    dtype = torch.bfloat16
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        expert_model_parallel_size=1,
+        expert_gtp_remat_size=egtp_remat_size,
+    )
+    model_parallel_cuda_manual_seed(42)
+
+    config = TransformerConfig(
+        num_attention_heads=8,
+        num_layers=1,
+        hidden_size=HIDDEN_OVERRIDE,
+        num_moe_experts=NUM_EXPERTS_OVERRIDE,
+        moe_router_topk=2,
+        moe_ffn_hidden_size=FFN_HIDDEN_OVERRIDE,
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="alltoall",
+        moe_aux_loss_coeff=0.0,
+        moe_router_load_balancing_type="none",
+        add_bias_linear=False,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        bias_activation_fusion=False,
+        params_dtype=dtype,
+        bf16=True,
+        hidden_dropout=0.0,
+        bias_dropout_fusion=False,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        # Force-enables moe_use_grouped_tensor in TransformerConfig.__post_init__, which is
+        # what leaves the *unfused* module on TE's grouped-tensor path.
+        use_transformer_engine_op_fuser=True,
+        # Required for TE to build main_grad_funcs at all; DDP normally sets this.
+        gradient_accumulation_fusion=True,
+        quant_recipe=_bf16_override_recipe(),
+    )
+
+    # MoELayer's default collection has no expt_gtp_remat entry; EGTP_remat sharding keys off it.
+    egtp_remat_group = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['expt_gtp_remat']
+    ).expt_gtp_remat
+    assert egtp_remat_group.size() == egtp_remat_size
+    moe_pg = get_default_pg_collection()
+    moe_pg.expt_gtp_remat = egtp_remat_group
+
+    moe_spec = get_moe_module_spec(
+        use_te=True, num_experts=NUM_EXPERTS_OVERRIDE, moe_grouped_gemm=True
+    )
+    layer = moe_spec(config, layer_number=1, pg_collection=moe_pg, name=MTP_LAYER_NAME)
+    layer.cuda()
+
+    try:
+        experts = layer.experts
+        assert isinstance(experts, TEGroupedMLP)
+
+        # Ingredient 1: the precision override took these experts off the op-fuser path (#7212).
+        assert not experts._with_fused_impl, (
+            "the bf16 override must keep these experts unfused; without that this test exercises "
+            "the fused path instead and cannot reproduce the bug"
+        )
+        # The config-level force-enable is in play for both cases: use_transformer_engine_op_fuser
+        # turns moe_use_grouped_tensor on for every layer, unfused ones included.
+        assert config.moe_use_grouped_tensor
+
+        # Ingredient 2: EGTP_remat > 1 makes the expert weights TE DistributedWeights.
+        sharded = [name for name, p in experts.named_parameters() if isinstance(p, GTPShardedParam)]
+        if egtp_remat_size > 1:
+            assert sharded, "EGTP_remat=2 must shard the grouped expert weights"
+            # Only now may the guard pull the module off the grouped-tensor path, where TE
+            # cannot accumulate wgrad into a sharded weight.
+            assert not experts.linear_fc1.use_grouped_tensor
+            assert not experts.linear_fc2.use_grouped_tensor
+            assert not experts._use_grouped_tensor  # also selects the m_splits form passed to TE
+        else:
+            assert not sharded, "EGTP_remat=1 must leave the grouped expert weights unsharded"
+            # Unfused but UNSHARDED is not the bug, and the grouped-tensor path is both faster
+            # and CUDA-graph-safe (device-side m_splits). The guard must leave it alone -- this
+            # is what stops it from silently disabling --moe-use-grouped-tensor at large.
+            assert experts.linear_fc1.use_grouped_tensor
+            assert experts.linear_fc2.use_grouped_tensor
+            assert experts._use_grouped_tensor
+
+        # DDP would allocate these; the wgrad closures are what the bug corrupts, so they must
+        # exist for the backward below to mean anything.
+        for p in experts.parameters():
+            if p.requires_grad and not hasattr(p, "main_grad"):
+                p.main_grad = torch.zeros_like(p.data, dtype=torch.float32)
+
+        x = torch.randn(
+            (SEQ_OVERRIDE, BATCH_OVERRIDE, HIDDEN_OVERRIDE),
+            dtype=dtype,
+            device="cuda",
+            requires_grad=True,
+        )
+        output, _ = layer(x)
+        # Pre-fix, egtp_remat_size=2 raises AttributeError: 'Tensor' object has no attribute
+        # 'main_grad' from grouped_linear.py::_backward_grouped_tensor.
+        output.mean().backward()
+
+        accumulated = [
+            name
+            for name, p in experts.named_parameters()
+            if getattr(p, "main_grad", None) is not None and p.main_grad.abs().sum() > 0
+        ]
+        assert accumulated, "no expert wgrad reached main_grad; wgrad accumulation silently no-op'd"
+    finally:
+        # Restore in finally: an assertion above would otherwise leave the EGTP_remat groups
+        # installed and break every later test that calls initialize_model_parallel.
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+
+
 class TestMoEEGTPCorrectness:
     def test_moe_egtp_loss_trajectory_matches_baseline(self):
         """EP=2+EGTP_remat=2 MoE per-step losses match EP=4 baseline: atol=rtol=1e-5; MXFP8"""
@@ -340,3 +529,21 @@ class TestMoEEGTPCorrectness:
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires at least 4 CUDA devices")
         _run_distributed(_worker_expert_bias_gtp_inclusive, 4)
+
+
+class TestMoEEGTPPrecisionOverride:
+    @pytest.mark.parametrize("egtp_remat_size", (1, 2))
+    def test_egtp_precision_override_backward(self, monkeypatch, egtp_remat_size):
+        """bf16 MTP override on grouped experts must survive backward.
+
+        ``egtp_remat_size=1`` is the control: it is the benchmark scripts' default and passes
+        today. ``egtp_remat_size=2`` is the repro.
+        """
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires at least 4 CUDA devices")
+        # _is_fused_impl_supported() requires this for the GLU fused kernel, and the production
+        # launch script exports it. Without it every expert is unfused for the wrong reason and
+        # the `_with_fused_impl` assertion would no longer prove the override did anything.
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+        # world=4 to match the rest of this file: EP=1 x EGTP_remat={1,2}, DP takes the remainder.
+        _run_distributed(_worker_egtp_precision_override_backward, 4, egtp_remat_size)

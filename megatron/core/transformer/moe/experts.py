@@ -95,6 +95,25 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import (
 logger = logging.getLogger(__name__)
 
 
+def _has_distributed_weights(*modules: torch.nn.Module) -> bool:
+    """Whether any module holds a weight TE treats as sharded (GTP/EGTP weight remat).
+
+    Asked of the constructed modules rather than of the config so this tracks whatever
+    actually got wrapped, and answers False on a TE too old to have the protocol.
+    Imported lazily: a module-scope import here would tie this file to a TE that ships
+    `distributed_weight`.
+    """
+    try:
+        from transformer_engine.pytorch.distributed_weight import is_distributed_weight
+    except ImportError:
+        return False
+    return any(
+        is_distributed_weight(param)
+        for module in modules
+        for param in module.parameters(recurse=False)
+    )
+
+
 class GroupedLinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in TEGroupedMLP."""
 
@@ -317,6 +336,29 @@ class TEGroupedMLP(MegatronModule):
             )
 
         self._use_grouped_tensor = self.config.moe_use_grouped_tensor
+        if (
+            self._use_grouped_tensor
+            and not self._with_fused_impl
+            and _has_distributed_weights(self.linear_fc1, self.linear_fc2)
+        ):
+            # TE's grouped-tensor path cannot accumulate wgrad into a sharded weight: it
+            # materializes the shards, then reads `.main_grad` off that plain tensor. The
+            # split-quantize path and the op fuser both handle sharding, so fall back only
+            # for unfused modules that hold sharded weights.
+            if self.config.moe_single_grouped_weight or self.config.moe_single_grouped_bias:
+                raise RuntimeError(
+                    "moe_single_grouped_weight/moe_single_grouped_bias require TE's "
+                    "grouped-tensor path, but these experts are unfused (a precision override "
+                    "took them off the op fuser) and hold GTP-sharded weights, which that path "
+                    "cannot accumulate wgrad into. Drop the precision override for this module, "
+                    "disable expert weight sharding, or disable the single-grouped flags."
+                )
+            self._use_grouped_tensor = False
+            # Read per-forward by TE, so flipping it after construction takes effect. Both flags
+            # must move together: this one also selects the m_splits form mcore passes below
+            # (CUDA tensor for grouped-tensor, host list for split-quantize).
+            self.linear_fc1.use_grouped_tensor = False
+            self.linear_fc2.use_grouped_tensor = False
         if self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
             assert HAVE_TE, "Quantized or TE grouped-tensor GroupedMLP execution requires TE."
             align_size = (

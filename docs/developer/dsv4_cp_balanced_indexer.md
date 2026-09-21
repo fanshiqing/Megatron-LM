@@ -12,7 +12,10 @@ Training entrypoints call prepare_packed_seq_params once after constructing
 the microbatch's PackedSeqParams. This shared training helper finalizes generic
 CP partition routes and conditionally prepares the balanced indexer layout.
 The feature-specific dependency belongs in this helper, rather than in the
-GPT or Hybrid entrypoint.
+GPT or Hybrid entrypoint. The helper forwards the normalized configuration's
+sequence_parallel flag to the generic finalizer. Sequence-parallel inputs use
+the fused TP x CP route when the groups support it; other inputs use the CP-only
+route. Each microbatch prebuilds only one route before any indexer-specific layouts.
 
 Middle pipeline stages pass their physical capacity explicitly when they
 receive raw sequence boundaries. Dynamic packed graphs otherwise derive their

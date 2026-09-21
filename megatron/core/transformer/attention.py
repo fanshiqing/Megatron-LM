@@ -26,7 +26,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_tp_cp_group
 from megatron.core.parallel_state import (
     get_data_parallel_group,
     get_data_parallel_rank,
@@ -80,7 +80,9 @@ except ImportError as e:
 
 if not HAVE_FA3:
     try:
-        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
+        from flashattn_hopper.flash_attn_interface import (
+            _flash_attn_forward,
+        )
         from flashattn_hopper.flash_attn_interface import (
             flash_attn_with_kvcache as flash_attn3_with_kvcache,
         )
@@ -1391,7 +1393,9 @@ class Attention(MegatronModule, ABC):
             packed_seq_params=packed_seq_params,
             cp_group=self.pg_collection.cp,
             tp_group=self.pg_collection.tp,
-            tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
+            tp_cp_group=resolve_tp_cp_group(
+                getattr(self.pg_collection, "tp_cp", None), packed_seq_params
+            ),
             target_partition_mode="zigzag",
             sequence_parallel=self.config.sequence_parallel,
             config=self.config,

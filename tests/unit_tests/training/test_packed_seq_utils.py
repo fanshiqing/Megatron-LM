@@ -19,26 +19,28 @@ class _Group:
         return 0
 
 
+@pytest.mark.parametrize("sequence_parallel", [False, True])
 @pytest.mark.parametrize(
     ("boundaries", "dynamic", "capacity"),
     [([0, 1024, 4096], False, None), ([0, 1024, 3000], False, 4096), ([0, 1024, 4096], True, None)],
     ids=["scheduler", "middle_pp_raw", "dynamic_graph_scheduler"],
 )
 def test_prepare_attention_routes_uses_physical_capacity(
-    monkeypatch, boundaries, dynamic, capacity
+    monkeypatch, boundaries, dynamic, capacity, sequence_parallel
 ):
     group = _Group()
     cu = torch.tensor(boundaries, dtype=torch.int32)
     packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
     calls = []
 
-    def finalize(params):
-        calls.append(params)
+    def finalize(params, *, sequence_parallel):
+        calls.append((params, sequence_parallel))
         params.cp_group = group
         return params
 
     monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", finalize)
     config = SimpleNamespace(
+        sequence_parallel=sequence_parallel,
         dsa_cp_balance_indexer=True,
         dsa_cp_balance_indexer_graph_dynamic_packs=dynamic,
         max_seqlen_per_dp_cp_rank=1024,
@@ -48,7 +50,7 @@ def test_prepare_attention_routes_uses_physical_capacity(
         cuda_graph_modules=["attn"],
     )
     result = packed_seq_utils.prepare_packed_seq_params(packed, config, capacity=capacity)
-    assert result is packed and calls == [packed]
+    assert result is packed and calls == [(packed, sequence_parallel)]
     if dynamic:
         from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
             get_graph_dynamic_plan,
@@ -62,5 +64,5 @@ def test_prepare_attention_routes_uses_physical_capacity(
 
 
 def test_unpacked_batch_needs_no_attention_config(monkeypatch):
-    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", lambda params: params)
+    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", lambda params, **_kwargs: params)
     assert packed_seq_utils.prepare_packed_seq_params(None, SimpleNamespace()) is None

@@ -17,7 +17,8 @@ def prepare_packed_seq_params(
 
     Args:
         packed_seq_params: Metadata for this microbatch, or None for unpacked input.
-        config: The model's transformer configuration.
+        config: The model's transformer configuration. Its sequence_parallel flag
+            selects the fused TP x CP route when the process groups support it.
         capacity: Global physical token capacity when it differs from the supplied
             sequence boundaries (for example, raw metadata on a middle PP stage).
             Dynamic packed graphs otherwise use the configured fixed capacity.
@@ -25,7 +26,9 @@ def prepare_packed_seq_params(
     Returns:
         The supplied metadata with its CP group and per-microbatch routes prepared.
     """
-    packed_seq_params = finalize_packed_seq_params(packed_seq_params)
+    packed_seq_params = finalize_packed_seq_params(
+        packed_seq_params, sequence_parallel=getattr(config, "sequence_parallel", False)
+    )
     if packed_seq_params is None or not getattr(config, "dsa_cp_balance_indexer", False):
         return packed_seq_params
 

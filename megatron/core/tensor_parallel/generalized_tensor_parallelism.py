@@ -1863,19 +1863,22 @@ class GTPShardedParam(torch.nn.Parameter):
         """Handle megatron DDP and gradient-accumulation fusion.
 
         Returns a cached dummy wgrad; sync callers use it as the graph-safe grad, async drains
-        discard it. It is zeroed when DDP will accumulate it — see below.
+        discard it. The real gradient is already in main_grad; DDP only needs
+        the readiness notification.
         """
         if hasattr(param, "grad_added_to_main_grad"):
             param.grad_added_to_main_grad = True
-        # This dummy becomes param.grad, and DDP accumulates it when zero_out_wgrad is set
-        # (DistributedDataParallel._make_backward_post_hook in distributed_data_parallel.py).
-        # get_dummy_wgrad returns a SHARED reused buffer, so it must be zeroed in that case
-        # or it injects whatever it last held into the gradient. Same pairing as layers.py.
+        # Preserve the zero_out_wgrad convention for the placeholder returned to autograd.
         if getattr(param, "zero_out_wgrad", False):
             dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype, zero=True)
         else:
             dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype)
         if getattr(param, "_grad_accum_hook", None) is not None:
+            # The real reduced gradient is already in main_grad. Discard any
+            # autograd placeholder before notifying DDP, including a dummy left
+            # by a previous MTP use or an ordinary warmup allocation. Capturing
+            # an add from that dummy could retain its address after it is freed.
+            param.grad = None
             param._grad_accum_hook()
 
         param._set_rs_state(GTPWeightState.NONE)

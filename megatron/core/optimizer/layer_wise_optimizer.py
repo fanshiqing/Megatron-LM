@@ -663,7 +663,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         self.layerwise_param_sync_via_bucket_group = (
             self.use_buffer_param_sync
             or self.overlap_param_gather
-            or config.reuse_grad_buf_for_mxfp8_param_ag
+            or getattr(config, 'reuse_grad_buf_for_mxfp8_param_ag', False)
         )
         if self.layerwise_param_sync_via_bucket_group and not self.use_buffer_param_sync:
             # Variable-size gathers stage owner FP32 masters into BF16 grad-buffer

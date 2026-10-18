@@ -48,10 +48,13 @@ from tests.unit_tests.test_fp8_param import TestFP8Param as _FP8ParamHarness
 from tests.unit_tests.test_fp8_param import fp8_available, reason_for_no_fp8
 from tests.unit_tests.test_utilities import Utils
 
-HAVE_FLA_SEQUENCE_PACKING, FLA_SEQUENCE_PACKING_REASON = check_fla_sequence_packing_support()
-HAVE_GDP_DEPS = all(
-    (HAVE_MAMBA_SSM, HAVE_EINOPS, HAVE_FLA, causal_conv1d_fn is not None, HAVE_FLA_SEQUENCE_PACKING)
-)
+HAVE_GDP_DEPS = all((HAVE_MAMBA_SSM, HAVE_EINOPS, HAVE_FLA, causal_conv1d_fn is not None))
+if HAVE_GDP_DEPS:
+    HAVE_FLA_SEQUENCE_PACKING, FLA_SEQUENCE_PACKING_REASON = check_fla_sequence_packing_support()
+    HAVE_GDP_DEPS = HAVE_FLA_SEQUENCE_PACKING
+else:
+    HAVE_FLA_SEQUENCE_PACKING = False
+    FLA_SEQUENCE_PACKING_REASON = "GDP requires mamba-ssm, einops, FLA, and causal-conv1d"
 
 
 def _gdp_moe_test_args(overlap, *, num_weight_shards):

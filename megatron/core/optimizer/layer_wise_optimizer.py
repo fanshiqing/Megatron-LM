@@ -656,15 +656,21 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # non-DistOpt and own whole params via ping-pong, so we use the legacy allgather_params.
         self.use_buffer_param_sync = full_param_layouts is not None
 
-        # Set up overlap param gather using DDP bucket infrastructure.
+        # Compact LayerWise buffers have a per-buffer DDP configuration distinct from
+        # their scalar-optimizer siblings. Select synchronization from the actual layout
+        # and the LayerWise options, rather than the model's global DistOpt flag.
         self.overlap_param_gather = config.overlap_param_gather
-        if self.overlap_param_gather and not self.use_buffer_param_sync:
-            # Legacy path: set up per-bucket param lists for variable-size all-gather.
-            # When use_buffer_param_sync is True, the standard distributed optimizer
-            # all-gather path is used and this setup is not needed.
+        self.layerwise_param_sync_via_bucket_group = (
+            self.use_buffer_param_sync
+            or self.overlap_param_gather
+            or config.reuse_grad_buf_for_mxfp8_param_ag
+        )
+        if self.layerwise_param_sync_via_bucket_group and not self.use_buffer_param_sync:
+            # Variable-size gathers stage owner FP32 masters into BF16 grad-buffer
+            # storage, for both synchronous and overlapped MXFP8 synchronization.
             assert (
                 model_chunks is not None
-            ), "model_chunks must be provided if overlap_param_gather is True"
+            ), "model_chunks must be provided for bucket-based LayerWise parameter sync"
             self.set_bucket_layerwise_params_list(model_chunks)
 
         if init_state_fn_list:
@@ -1409,14 +1415,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # All-gather updated params. If overlap_param_gather is True, the all-gather
         # is deferred to the forward pre-hooks via DDP bucket infrastructure.
         if not self.overlap_param_gather:
-            if self.use_buffer_param_sync:
-                # Model params are views into the DDP param buffer
-                # (ddp_config.use_distributed_optimizer=True). The optimizer step
-                # already copied updated fp32 main params → bf16 model params (=
-                # buffer views), so the buffer is up-to-date. Trigger the standard
-                # buffer all-gather, but only for LayerWise-managed bucket groups
-                # so a sibling DistributedOptimizer's own ``start_param_sync`` call
-                # is not duplicated for the same buckets.
+            if self.layerwise_param_sync_via_bucket_group:
+                # Full layouts use the standard DDP buffer all-gather. With
+                # use_layer_wise_param_layout=False, the variable-size path uses grad_data.
+                # Both cases sync only the LayerWise-owned bucket groups.
                 self.start_param_sync_for_bucket_group_subset()
             else:
                 self.allgather_params()

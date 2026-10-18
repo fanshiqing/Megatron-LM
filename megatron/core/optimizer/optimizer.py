@@ -1112,13 +1112,11 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             # Seed the fp32 master from the high-precision pre-quantization init
                             # for fp8 params (not the lossy fp8 dequant), matching DistOpt so
                             # fp8_param_gather ON/OFF hold an identical master at iter 0.
-                            if hasattr(param, 'get_high_precision_init_val'):
-                                main_param = (
-                                    param.get_high_precision_init_val()
-                                    .detach()
-                                    .clone()
-                                    .to(param.device)
-                                    .float()
+                            get_init = getattr(param, 'get_high_precision_init_val', None)
+                            high_precision_init = get_init() if get_init is not None else None
+                            if high_precision_init is not None:
+                                main_param = high_precision_init.detach().to(
+                                    device=param.device, dtype=torch.float32, copy=True
                                 )
                                 param.clear_high_precision_init_val()
                             else:

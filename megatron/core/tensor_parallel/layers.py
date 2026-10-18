@@ -124,6 +124,8 @@ def copy_gtp_attributes(destination, source):
         "allreduce",
         "gtp_replica_group",
         "pad_length",
+        "gtp_remat_size",
+        "group",
     ):
         if hasattr(source, attr):
             setattr(destination, attr, getattr(source, attr))

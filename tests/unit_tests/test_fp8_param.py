@@ -293,11 +293,17 @@ class TestFP8Param:
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
         if getattr(args, "use_layer_wise_distributed_optimizer", False):
-            has_param_layout = getattr(gpt_model[0], "full_param_layout", None) is not None
-            assert has_param_layout == args.use_layer_wise_param_layout, (
-                "LayerWise test did not enter the requested parameter-layout path: "
-                f"requested={args.use_layer_wise_param_layout}, actual={has_param_layout}"
-            )
+            # DSV4 constructs FullParamLayout for both compact and padded layouts.
+            # Its per-buffer DistOpt flag distinguishes the actual Muon storage path.
+            model = gpt_model[0]
+            assert model.full_param_layout is not None
+            for buffer in model.buffers + model.expert_parallel_buffers:
+                if getattr(buffer.params[0], "is_managed_by_layer_wise_optimizer", False):
+                    actual = buffer.ddp_config.use_distributed_optimizer
+                    assert actual == args.use_layer_wise_param_layout, (
+                        "LayerWise test did not enter the requested parameter-layout path: "
+                        f"requested={args.use_layer_wise_param_layout}, actual={actual}"
+                    )
         self._on_model_built(gpt_model, optimizer, args)
 
         # Hard coded to use cuda_graph_impl="transformer_engine"
@@ -331,9 +337,11 @@ class TestFP8Param:
                 assert num_fp8_params == 4 * fp8_layers
             else:
                 assert num_fp8_params > 0
-                assert any(
-                    not getattr(param, 'allreduce', True) for param in gpt_model[0].parameters()
-                )
+                # EP1 experts use the regular all-reduce group.
+                if args.expert_model_parallel_size > 1:
+                    assert any(
+                        not getattr(param, 'allreduce', True) for param in gpt_model[0].parameters()
+                    )
                 if not inference:
                     assert len(optimizer.chained_optimizers) >= 2
 

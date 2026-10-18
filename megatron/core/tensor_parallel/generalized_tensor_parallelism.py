@@ -42,7 +42,7 @@ from megatron.core.tensor_parallel.gtp_cuda_graphs import (
     register_capture_comm,
     register_capture_wgrad_ring_slot,
 )
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import ensure_params_ready, log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +98,10 @@ except (ImportError, ModuleNotFoundError):
     MXFP8Quantizer = MagicMock()
     nvtx_range_pop = nvtx_range_push = round_up_to_nearest_multiple = MagicMock()
     HAVE_TE = False
+
+
+# TE sets this flag for BF16 activation recompute too; use a dtype-neutral name.
+in_activation_recompute_phase = in_fp8_activation_recompute_phase
 
 
 class GTPChain(str, Enum):
@@ -1281,10 +1285,19 @@ class GTPShardedParam(torch.nn.Parameter):
 
         weights = self._weights
 
+        # Look-ahead prefetch reads the next module's shards before its forward
+        # pre-hook runs. Finish DDP's parameter gather (including MXFP8 copy-back)
+        # before GTP consumes those shards, or it can materialize stale weights.
+        # Backward/recompute reuse this iteration's published weights. Do not
+        # restart parameter sync there: a completed gradient bucket may already
+        # have reset its gather state for the next iteration.
+        if fwd and not in_activation_recompute_phase():
+            ensure_params_ready(weights)
+
         # 1. Transition state for async gathers. Skip during recompute-forward: it gathers
         #    rowwise (_ag_ticket_fwd) while a bwd-chain prefetch may hold an in-flight columnwise
         #    AG state (_ag_ticket_bwd) on the same weight — clobbering breaks the dgrad consume.
-        if GTP_CONFIG.check_param_states and not in_fp8_activation_recompute_phase():
+        if GTP_CONFIG.check_param_states and not in_activation_recompute_phase():
             new_state = GTPWeightState.ASYNC_WAIT if async_op else GTPWeightState.DATA_READY_SYNC
             for w in weights:
                 w._set_state(new_state)
@@ -1591,7 +1604,7 @@ class GTPShardedParam(torch.nn.Parameter):
         # During an activation-recompute forward (runs in backward), route consume +
         # prefetch through the recompute-forward chain on its own _recompute_* slot
         # (see __init__) instead of the fwd/bwd chains; lazy-built below.
-        in_recompute = in_fp8_activation_recompute_phase()
+        in_recompute = in_activation_recompute_phase()
         use_recompute_chain = in_recompute and GTP_CONFIG.weight_prefetch
 
         # Reaching a forward gather proves the previous backward finished, so the chains it

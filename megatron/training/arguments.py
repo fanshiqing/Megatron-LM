@@ -3548,8 +3548,8 @@ def _add_regularization_args(parser):
     group.add_argument(
         '--muon-tp-mode',
         type=str,
-        default='blockwise',
-        choices=['blockwise', 'duplicated', 'distributed'],
+        default='duplicated',
+        choices=['blockwise', 'duplicated', 'distributed', 'auto'],
         help='How to perform NS calculation for tensor model parallel weights. '
         'For QKV weights, distributed mode applies only to projection splits with '
         'complete local query groups; other layouts fall back to non-TP NS',

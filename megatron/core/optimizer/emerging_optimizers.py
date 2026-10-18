@@ -390,6 +390,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             # Only forward the kwarg when enabled; older emerging_optimizers do not
             # accept it at all, and __init__ has already rejected use_syrk on those.
             ns_kwargs = {"use_syrk": True} if use_syrk else {}
+            # Split-QKV reconstructs complete projections before calling this closure.
+            # Preserve that path's full-matrix semantics when the outer mode is auto;
+            # generic dense GTP weights pass their explicitly resolved mode below.
+            if tp_mode_this_group == "auto":
+                tp_mode_this_group = "duplicated"
             orth_grad = newton_schulz_tp(
                 grad,
                 steps=num_ns_steps,
@@ -1067,6 +1072,9 @@ def _muon_registry_config_to_kwargs(
             kwargs["tp_mode"] = _muon_bucket_tp_mode(config, is_expert)
         return kwargs
     kwargs.update(_kwargs_from_config(cls, "muon", config))
+    # DSV4's TensorParallelMuon supports per-head QKV splitting. Expert layer
+    # sharding has no QKV split path and its constructor does not accept this flag.
+    kwargs.pop("split_qkv_per_head", None)
     # 'layer_sharded' selected the class; it is not a TensorParallelMuon mode, so the
     # delegated (empty-homes fallback) path runs the bitwise reference mode instead.
     kwargs["tp_mode"] = "duplicated"

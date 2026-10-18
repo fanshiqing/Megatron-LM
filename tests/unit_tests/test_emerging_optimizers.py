@@ -1864,7 +1864,8 @@ def test_muon_optimizer_multiple_steps():
         ), f"Weight should change at step {i}"
 
 
-def test_muon_optimizer_qkv_split():
+@pytest.mark.parametrize("tp_mode", ["duplicated", "auto"])
+def test_muon_optimizer_qkv_split(tp_mode):
     """Test TensorParallelMuon optimizer with QKV splitting."""
     # Create a model with QKV-like parameter
     qkv_size = 3 * 64 * 16  # Combined Q, K, V dimensions, 16 heads x 64 per head
@@ -1888,7 +1889,7 @@ def test_muon_optimizer_qkv_split():
         qkv_split_shapes=qkv_split_shapes,
         num_ns_steps=5,
         pg_collection=None,
-        tp_mode="duplicated",
+        tp_mode=tp_mode,
     )
 
     input_tensor = torch.randn(16, hidden_size, dtype=torch.float32, device='cuda')
@@ -1912,7 +1913,7 @@ def test_muon_optimizer_qkv_split():
         split_qkv=False,
         num_ns_steps=5,
         pg_collection=None,
-        tp_mode="duplicated",
+        tp_mode=tp_mode,
     )
 
     output = model(input_tensor)

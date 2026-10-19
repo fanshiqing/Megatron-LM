@@ -35,6 +35,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
 if not HAVE_GTP:
@@ -565,6 +566,23 @@ def _worker_real_pool_registration(rank, world_size, port):
 
 
 class TestRealPoolRegistration:
+    def test_repeated_wgrad_reuses_one_buffer_in_full_iteration_capture(self, monkeypatch):
+        """MTP-style repeated backwards must not need extra registered storage at capture."""
+        _requires_multi_gpu(4)
+        monkeypatch.setattr("megatron.core.full_cuda_graph.get_all_rng_states", lambda: {})
+        monkeypatch.setattr(GTP_CONFIG, "async_reduction", True)
+        monkeypatch.setattr(GTP_CONFIG, "calculate_per_token_loss", False)
+        monkeypatch.setattr(gtp_module, "_FULL_ITERATION", True)
+        _run_distributed(_worker_repeated_wgrad_full_iteration, 4)
+
+    def test_full_iteration_reuses_registered_scratch_after_warmup(self, monkeypatch):
+        """Warmup fences retire, captured RS-to-overwrite dependencies survive replay, and the
+        fence a capture leaves on the slot never reaches an eager wait (graph reset) or query
+        (the next capture's reset)."""
+        _requires_multi_gpu(4)
+        monkeypatch.setattr("megatron.core.full_cuda_graph.get_all_rng_states", lambda: {})
+        _run_distributed(_worker_full_iteration_registered_scratch, 4)
+
     def test_register_alloc_collective_deregister(self):
         """The VMM round trip: it proves ncclCommWindowRegister accepts
         current-device-only mapped VMM memory."""
@@ -572,71 +590,130 @@ class TestRealPoolRegistration:
         _run_distributed(_worker_real_pool_registration, 4)
 
 
-@pytest.mark.parametrize("out_features", [100, 128])
-def test_repeated_weight_symmetric_full_graph(out_features):
-    """Repeated MTP-style wgrads reuse one registered buffer during capture and replay."""
-    _requires_multi_gpu(4)
-    _run_distributed(_worker_repeated_weight_symmetric_full_graph, 4, out_features)
-
-
-def _worker_repeated_weight_symmetric_full_graph(rank, world_size, port, out_features):
-    del port
+def _worker_repeated_wgrad_full_iteration(rank, world_size, port):
     group = dist.new_group(list(range(world_size)))
     register_gtp_symm_pool(group)
-    layer = _make_gtp_linear(64, out_features, group)
+    layer = _make_gtp_linear(64, 128, group)
+    gtp_module.classify_gtp_chains(layer)
     weight = layer.weight
-    weight.chain_id = gtp_module.GTPChain.GRAPHED.value
-    # A non-head weight issues asynchronous RS, as the reused MTP output head does.
-    weight.prev_w = _make_gtp_linear(64, 64, group).weight
-    weight.main_grad = torch.zeros_like(weight)
-    weight.grad_added_to_main_grad = False
-    inputs = [
-        torch.empty(weight._unsharded_shape, device="cuda", dtype=torch.bfloat16) for _ in range(2)
-    ]
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
+    weight.prev_w = object()  # Keep each reduction asynchronous until the next use.
+    weight.main_grad = torch.zeros(weight.shape, dtype=torch.float32, device="cuda")
+    source = torch.full(weight._unsharded_shape, float(rank), device="cuda")
     pointers = []
 
-    def step():
+    def forward_backward_func(**_):
         weight.main_grad.zero_()
-        pointers.clear()
-        for value in inputs:
-            buf = weight.get_wgrad_tensor()
-            pointers.append(buf.data_ptr())
-            buf.copy_(value)
-            weight.wgrad_reduce_scatter(buf)
-        weight._wait_reduce_scatter(finalize_grad=True)
-        weight.rs_event.wait()
-        weight._already_finalized = False
-        # Match full-iteration finalization: join the side stream before capture ends.
-        torch.cuda.current_stream().wait_stream(gtp_module.get_rs_stream(weight.chain_id, group))
-
-    def set_inputs(iteration):
-        for index, value in enumerate(inputs):
-            value.fill_(rank + iteration + index + 1)
-
-    # Warmup recycles a single send buffer; capture must not require an extra one.
-    with torch.cuda.stream(stream):
-        set_inputs(0)
         for _ in range(3):
-            step()
-    torch.cuda.current_stream().wait_stream(stream)
-    torch.cuda.synchronize()
-    assert len(set(pointers)) == 1
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        step()
-    assert len(set(pointers)) == 1
-    for iteration in range(6):
-        set_inputs(iteration)
-        graph.replay()
+            buffer = weight.get_wgrad_tensor()
+            pointers.append(buffer.data_ptr())
+            buffer.copy_(source)
+            weight.wgrad_reduce_scatter(buffer)
+        weight._wait_reduce_scatter(finalize_grad=True)
+        # Like training's gradient finalization, join the whole RS stream,
+        # including the main_grad addition after the send-buffer reuse event.
+        torch.cuda.current_stream().wait_stream(weight._cached_rs_stream)
+        return [{"loss": weight.main_grad}]
+
+    wrapper = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=1)
+    wrapper.reset_cuda_graph()
+    kwargs = dict(
+        model=[torch.nn.Identity()],
+        data_iterator=None,
+        num_microbatches=1,
+        seq_length=1,
+        forward_only=False,
+    )
+    try:
+        wrapper(**kwargs)
+        wrapper(**kwargs)
+        assert len(set(pointers)) == 1
+        for step in range(10):
+            source.fill_(rank + step)
+            result = wrapper(**kwargs)
+            torch.cuda.synchronize()
+            expected = 3 * (step + (world_size - 1) / 2)
+            torch.testing.assert_close(
+                result[0]["loss"], torch.full_like(weight.main_grad, expected), atol=0, rtol=0
+            )
+        assert len(pointers) == 6, "Replay must not call the Python buffer allocator"
+    finally:
         torch.cuda.synchronize()
-        # Each RS averages across ranks; both uses must contribute exactly once.
-        expected = torch.full_like(weight.main_grad, world_size - 1 + 2 * iteration + 3)
-        valid_rows = max(0, min(weight.shape[0], out_features - rank * weight.shape[0]))
-        expected[valid_rows:].zero_()
-        torch.testing.assert_close(weight.main_grad, expected, rtol=0, atol=0)
-    graph.reset()
-    torch.cuda.synchronize()
-    deregister_and_clear_gtp_symm_pools()
-    dist.destroy_process_group(group)
+        wrapper.reset_cuda_graph()
+        deregister_and_clear_gtp_symm_pools()
+        dist.destroy_process_group(group)
+
+
+def _worker_full_iteration_registered_scratch(rank, world_size, port):
+    """One registered send buffer through warmup, capture, replays, a graph reset with an eager
+    iteration and a recapture, then a forward-only validation capture. The slot a capture frees
+    keeps a fence recorded inside the graph: an eager wait on it fails with cudaErrorInvalidValue,
+    so reset_cuda_graph must drop it before eager iterations, and the next capture's reset must
+    drop it without querying it."""
+    group = dist.new_group(list(range(world_size)))
+    register_gtp_symm_pool(group)
+    count = 262144
+    source = torch.full((count * world_size,), float(rank), device="cuda")
+    output = torch.empty(count, device="cuda")
+    rs_stream = torch.cuda.Stream()
+    events = []  # keep every fence alive, as rs_event is in production
+    pointers = []
+
+    def forward_backward_func(forward_only=False, **_):
+        if forward_only:
+            # Validation mirrors production: forward only, no wgrad, no pool traffic.
+            output.copy_(source[:count])
+            return [{"loss": output}]
+        buf = symmetric_wgrad_pool.alloc(source.shape, source.dtype, source.device, group)
+        pointers.append(buf.data_ptr())
+        buf.copy_(source)
+        rs_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(rs_stream):
+            torch.cuda._sleep(500000)
+            dist.reduce_scatter_tensor(output, buf, group=group, async_op=True).wait()
+            ready = torch.cuda.Event()
+            ready.record()
+        events.append(ready)
+        symmetric_wgrad_pool.free(buf, ready_event=ready)
+        reused = symmetric_wgrad_pool.alloc(source.shape, source.dtype, source.device, group)
+        # This overwrite must remain behind the captured reduce-scatter reading the same buffer.
+        reused.zero_()
+        symmetric_wgrad_pool.free(reused, ready_event=ready)
+        return [{"loss": output}]
+
+    wrapper = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=1)
+    wrapper.reset_cuda_graph()
+    common = dict(model=[torch.nn.Identity()], data_iterator=None, num_microbatches=1, seq_length=1)
+
+    def run(value, forward_only=False):
+        source.fill_(rank + value)
+        result = wrapper(forward_only=forward_only, **common)
+        torch.cuda.synchronize()
+        if forward_only:
+            expected = float(rank + value)
+        else:
+            expected = world_size * value + world_size * (world_size - 1) / 2
+        torch.testing.assert_close(
+            result[0]["loss"], torch.full_like(output, expected), atol=0, rtol=0
+        )
+
+    try:
+        run(0)  # eager warmup
+        run(1)  # capture + replay
+        assert len(set(pointers)) == 1, "Capture must preserve the warmed registered address"
+        for step in range(2, 12):
+            run(step)
+        assert len(pointers) == 2, "Replay must not call the Python buffer allocator"
+        wrapper.reset_cuda_graph()  # back to eager; the slot still carries the captured fence
+        run(12)  # eager alloc: fails without the drop in reset_cuda_graph
+        run(13)  # recapture
+        run(14)  # replay
+        run(15, forward_only=True)  # eager validation warmup, no pool traffic
+        run(16, forward_only=True)  # validation capture: its reset sees captured fences
+        run(17, forward_only=True)  # replay
+        run(18)  # the training graph is still valid
+        assert len(pointers) == 4 and len(set(pointers)) == 1, pointers
+    finally:
+        torch.cuda.synchronize()
+        wrapper.reset_cuda_graph()
+        deregister_and_clear_gtp_symm_pools()
+        dist.destroy_process_group(group)

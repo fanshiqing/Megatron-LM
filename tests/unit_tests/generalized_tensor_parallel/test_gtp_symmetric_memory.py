@@ -570,3 +570,73 @@ class TestRealPoolRegistration:
         current-device-only mapped VMM memory."""
         _requires_multi_gpu(4)
         _run_distributed(_worker_real_pool_registration, 4)
+
+
+@pytest.mark.parametrize("out_features", [100, 128])
+def test_repeated_weight_symmetric_full_graph(out_features):
+    """Repeated MTP-style wgrads reuse one registered buffer during capture and replay."""
+    _requires_multi_gpu(4)
+    _run_distributed(_worker_repeated_weight_symmetric_full_graph, 4, out_features)
+
+
+def _worker_repeated_weight_symmetric_full_graph(rank, world_size, port, out_features):
+    del port
+    group = dist.new_group(list(range(world_size)))
+    register_gtp_symm_pool(group)
+    layer = _make_gtp_linear(64, out_features, group)
+    weight = layer.weight
+    weight.chain_id = gtp_module.GTPChain.GRAPHED.value
+    # A non-head weight issues asynchronous RS, as the reused MTP output head does.
+    weight.prev_w = _make_gtp_linear(64, 64, group).weight
+    weight.main_grad = torch.zeros_like(weight)
+    weight.grad_added_to_main_grad = False
+    inputs = [
+        torch.empty(weight._unsharded_shape, device="cuda", dtype=torch.bfloat16) for _ in range(2)
+    ]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    pointers = []
+
+    def step():
+        weight.main_grad.zero_()
+        pointers.clear()
+        for value in inputs:
+            buf = weight.get_wgrad_tensor()
+            pointers.append(buf.data_ptr())
+            buf.copy_(value)
+            weight.wgrad_reduce_scatter(buf)
+        weight._wait_reduce_scatter(finalize_grad=True)
+        weight.rs_event.wait()
+        weight._already_finalized = False
+        # Match full-iteration finalization: join the side stream before capture ends.
+        torch.cuda.current_stream().wait_stream(gtp_module.get_rs_stream(weight.chain_id, group))
+
+    def set_inputs(iteration):
+        for index, value in enumerate(inputs):
+            value.fill_(rank + iteration + index + 1)
+
+    # Warmup recycles a single send buffer; capture must not require an extra one.
+    with torch.cuda.stream(stream):
+        set_inputs(0)
+        for _ in range(3):
+            step()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    assert len(set(pointers)) == 1
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        step()
+    assert len(set(pointers)) == 1
+    for iteration in range(6):
+        set_inputs(iteration)
+        graph.replay()
+        torch.cuda.synchronize()
+        # Each RS averages across ranks; both uses must contribute exactly once.
+        expected = torch.full_like(weight.main_grad, world_size - 1 + 2 * iteration + 3)
+        valid_rows = max(0, min(weight.shape[0], out_features - rank * weight.shape[0]))
+        expected[valid_rows:].zero_()
+        torch.testing.assert_close(weight.main_grad, expected, rtol=0, atol=0)
+    graph.reset()
+    torch.cuda.synchronize()
+    deregister_and_clear_gtp_symm_pools()
+    dist.destroy_process_group(group)

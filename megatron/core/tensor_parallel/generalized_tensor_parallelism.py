@@ -1797,11 +1797,12 @@ class GTPShardedParam(torch.nn.Parameter):
             # is still busy. Allocating a second raises this bucket's high-water mark for good --
             # the pool never shrinks, so every buffer in it is live at the peak. Drain our own RS
             # so the alloc below recycles that buffer, trading one overlap for the permanent
-            # bytes. Capture-guarded: the branch is host-side.
+            # bytes. Keep this drain during capture too: warmup sizes the pool for this
+            # reuse schedule, and skipping it would require a new registered allocation.
+            # The Work wait and rs_event wait record the RS-to-writer dependency in the graph.
             if (
                 GTP_CONFIG.async_reduction
                 and self._wgrad_rs_handle is not None
-                and not torch.cuda.is_current_stream_capturing()
                 and not symmetric_wgrad_pool.has_free(
                     self._unsharded_shape_padded, self.main_grad.dtype, self.group
                 )

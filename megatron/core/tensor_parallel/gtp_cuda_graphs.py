@@ -122,7 +122,7 @@ def allocate_graph_wgrad_rings(
     full_iteration: bool,
     async_reduction: bool,
     ring_size: int,
-    graphed_chain_id: str,
+    chain_is_graphed: Callable[[str], bool],
     stream_key: Callable[[str, object], tuple],
 ) -> None:
     """Allocate bounded persistent inputs for cross-graph asynchronous reduce-scatter.
@@ -140,7 +140,7 @@ def allocate_graph_wgrad_rings(
     for chain_param in params:
         if not getattr(chain_param, "is_gtp_weight_remat", False):
             continue
-        if chain_param.chain_id != graphed_chain_id or chain_param.prev_w is None:
+        if not chain_is_graphed(chain_param.chain_id) or chain_param.prev_w is None:
             continue
         for param in chain_param._weights:
             if id(param) in seen_params:
@@ -152,6 +152,7 @@ def allocate_graph_wgrad_rings(
                 )
             key = (
                 stream_key(param.chain_id, param.group),
+                param.chain_id,  # FC1/FC2 can be owned by the same graph; do not alias their rings.
                 param._unsharded_shape,
                 param._unsharded_shape_padded,
                 param.main_grad.dtype,

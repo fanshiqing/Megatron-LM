@@ -78,8 +78,8 @@ except ImportError:
 if HAVE_GTP:
     from megatron.core.tensor_parallel.gtp_api import (
         GTP_CONFIG,
-        GTPChain,
         get_ag_stream,
+        get_graphed_chain_ids,
         get_rs_stream,
         initialize_graph_wgrad_rings,
         set_cuda_graph_mempool,
@@ -90,8 +90,8 @@ else:
     # Placeholders so static analysis does not flag these GTP-only symbols as
     # possibly-used-before-assignment; every use site is guarded by HAVE_GTP /
     # gtp_remat at runtime.
-    GTPChain = None
     GTP_CONFIG = None
+    get_graphed_chain_ids = None
     get_ag_stream = None
     get_rs_stream = None
     initialize_graph_wgrad_rings = None
@@ -1023,11 +1023,15 @@ class _CudaGraphRunner(torch.nn.Module):
 
         Backward capture dynamically discovers exact owned streams via track_gtp_capture_comms().
         """
-        ag = get_ag_stream(GTPChain.GRAPHED.value, group)
-        rs = get_rs_stream(GTPChain.GRAPHED.value, group)
-        self.fwd_side_streams.append(ag)
-        self.bwd_side_streams.append(ag)
-        self.bwd_side_streams.append(rs)
+        for chain_id in get_graphed_chain_ids():
+            ag = get_ag_stream(chain_id, group)
+            rs = get_rs_stream(chain_id, group)
+            # Grouped FC1/FC2 have separate chains but share communication streams.
+            if ag not in self.fwd_side_streams:
+                self.fwd_side_streams.append(ag)
+            for stream in (ag, rs):
+                if stream not in self.bwd_side_streams:
+                    self.bwd_side_streams.append(stream)
 
     def _sync_against_side_streams(self, side_streams):
         """Make registered side streams wait for the current stream.
@@ -1060,6 +1064,9 @@ class _CudaGraphRunner(torch.nn.Module):
         finalized = {}  # id → param
         for p in self.params_to_backprop:
             if not getattr(p, 'is_gtp_weight_remat', False):
+                continue
+            if getattr(p, "is_routed_expert", False) and p.weight_list is None:
+                # The grouped leader owns all expert shards and their finalize cascade.
                 continue
             if getattr(p, "prev_w", None) is None:
                 for w in getattr(p, "_weights", [p]):
@@ -1319,7 +1326,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     )
 
                 if self.gtp_remat:
-                    wait_async_comms(GTPChain.GRAPHED.value)
+                    wait_async_comms(graphed_only=True)
                     self._sync_against_side_streams(self.bwd_side_streams)
 
             _set_warmup_end()
@@ -1351,7 +1358,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
                     if self.gtp_remat:
                         # Forward only issues AG prefetches (no wgrad RS), so drain AG and skip RS.
-                        wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True)
+                        wait_async_comms(graphed_only=True, skip_rs=True)
 
                     if self.fwd_side_streams:
                         self._wait_side_streams(self.fwd_side_streams)
@@ -1494,7 +1501,7 @@ class _CudaGraphRunner(torch.nn.Module):
             #             happen here (see wait_async_comms).
             if self.gtp_remat:
                 # Phase 1: drain AG
-                wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True, params=capture_comms.params)
+                wait_async_comms(graphed_only=True, skip_rs=True, params=capture_comms.params)
                 self._wait_side_streams(capture_comms.ag_streams)
 
                 # Release the next runner after AG drain but before RS drain.
@@ -1502,7 +1509,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
                 # Phase 2: in-graph RS drain + finalize.
                 wait_async_comms(
-                    GTPChain.GRAPHED.value, finalize_after_drain=True, params=capture_comms.params
+                    graphed_only=True, finalize_after_drain=True, params=capture_comms.params
                 )
                 self._wait_side_streams(capture_comms.rs_streams)
 
@@ -1524,19 +1531,11 @@ class _CudaGraphRunner(torch.nn.Module):
         # replay-invariant — so Graphed.backward avoids per-replay group lookups.
         self._gtp_finalize_hook_plan = []
         if self.gtp_remat and self.finalized_during_bwd_capture:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=["gtp_remat", "expt_gtp_remat"]
-            )
-            dense_group = pg_collection.gtp_remat
-            expert_group = pg_collection.expt_gtp_remat
-            params_by_group = defaultdict(list)
+            params_by_stream = defaultdict(list)
             for param in self.finalized_during_bwd_capture:
-                is_expert = not getattr(param, 'allreduce', True)
-                params_by_group[expert_group if is_expert else dense_group].append(param)
-            self._gtp_finalize_hook_plan = [
-                (get_rs_stream(GTPChain.GRAPHED.value, group), params)
-                for group, params in params_by_group.items()
-            ]
+                stream = get_rs_stream(param.chain_id, param.group)
+                params_by_stream[stream].append(param)
+            self._gtp_finalize_hook_plan = list(params_by_stream.items())
 
         for arg in args_to_clear_buffers:
             arg.cg_buffer_metadata.bwd_cudagraph_buffer = None

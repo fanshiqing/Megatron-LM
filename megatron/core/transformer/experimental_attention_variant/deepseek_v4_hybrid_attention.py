@@ -597,6 +597,13 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             (self.config.qk_head_dim, self.config.qk_pos_emb_head_dim),
         )
 
+        kv_pg_collection = pg_collection
+        if "dsv4_kv_proj" in self.config.gtp_remat_opt_out_modules:
+            # Explicit None disables the GTP resolver's legacy-global fallback for this
+            # projection only. Do not mutate the caller's collection: Q/output projections
+            # keep their original sharding. Replicated gradient finalization covers GTP.
+            kv_pg_collection = ProcessGroupCollection(tp=pg_collection.tp, gtp_remat=None)
+
         self.linear_kv_proj = build_module(
             submodules.linear_kv_proj,
             self.config.hidden_size,
@@ -610,6 +617,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             tp_comm_buffer_name='kv_up_proj',
             tp_group=pg_collection.tp,
             name=(name + ".linear_kv_proj") if name is not None else None,
+            pg_collection=kv_pg_collection,
         )
         self.kv_layernorm = submodules.kv_layernorm(
             hidden_size=self.config.v_head_dim,

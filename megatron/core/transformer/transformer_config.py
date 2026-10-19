@@ -1170,6 +1170,17 @@ class TransformerConfig(ModelParallelConfig):
         is large enough for the all-gather to amortize.
     """
 
+    gtp_remat_opt_out_modules: list[str] = field(default_factory=list)
+    """Modules to keep replicated across GTP_remat peers. Allowed values:
+
+      - ``"dsv4_kv_proj"`` — replicate DeepSeek-V4 hybrid attention's small
+        ``linear_kv_proj``. Ordinary DDP and replicated-GTP gradient finalization still
+        synchronize these weights; optimizer state follows the selected optimizer layout.
+
+    Empty by default. Select modules using measured collective cost and memory headroom,
+    rather than applying a universal parameter-size threshold.
+    """
+
     moe_flex_dispatcher_num_sms: Optional[int] = None
     """Number of SMs for the flex token dispatcher's dispatch/combine communication, for all
     backends (deepep, hybridep, ncclep). None lets each backend use its own default. Unifies the
@@ -3025,6 +3036,15 @@ class TransformerConfig(ModelParallelConfig):
                 f"Invalid choices for gtp_remat_opt_in_modules: {invalid}. "
                 f"Allowed modules are: {_allowed_gtp_remat_opt_in_modules}"
             )
+
+        if self.gtp_remat_opt_out_modules:
+            allowed_opt_out = {"dsv4_kv_proj"}
+            invalid = set(self.gtp_remat_opt_out_modules) - allowed_opt_out
+            if invalid:
+                raise ValueError(
+                    f"Invalid choices for gtp_remat_opt_out_modules: {invalid}. "
+                    f"Allowed modules are: {allowed_opt_out}"
+                )
 
         if self.moe_paged_stash:
             assert not self.cpu_offloading, "moe_paged_stash cannot be enabled with cpu_offloading."

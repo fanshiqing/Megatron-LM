@@ -61,6 +61,7 @@ def _get_gtp_symm_pool(group: dist.ProcessGroup) -> torch.cuda.MemPool:
         try:
             vmm_symm_allocator.init()
             pool = vmm_symm_allocator.create_vmm_mem_pool()
+            backend = "vmm"
         except RuntimeError as e:
             log_single_rank(
                 logger,
@@ -72,7 +73,15 @@ def _get_gtp_symm_pool(group: dist.ProcessGroup) -> torch.cuda.MemPool:
             )
             nccl_allocator.init()
             pool = nccl_allocator.create_nccl_mem_pool(symmetric=True)
+            backend = "ncclMemAlloc"
         _pools[name] = pool
+        # One startup record per rank/group makes fallback visible at multi-node scale.
+        logger.info(
+            "[MCORE][GTP] Symmetric allocator rank=%s group=%s backend=%s",
+            dist.get_rank() if dist.is_initialized() else -1,
+            name,
+            backend,
+        )
     return pool
 
 

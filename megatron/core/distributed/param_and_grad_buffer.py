@@ -2014,7 +2014,9 @@ def partition_buckets(
     # merge them into a single group. Split by the effective per-bucket use_distributed_optimizer
     # instead, preserving order. When all buckets agree (the non-decoupled case) this collapses
     # to exactly one group, identical to the previous behavior.
-    if force_single_bucket_group:
+    # FP32-accumulating async RS owns one completion handle per bucket. Even a
+    # non-first VPP chunk must keep these groups separate so every handle is waited.
+    if force_single_bucket_group and not reduce_scatter_with_fp32_accumulation:
         data_parallel_group = buffers[0].data_parallel_group
         data_parallel_world_size = buffers[0].data_parallel_world_size
         ordered_distopt_values = []

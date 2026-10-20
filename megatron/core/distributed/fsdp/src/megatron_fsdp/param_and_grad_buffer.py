@@ -315,7 +315,7 @@ def build_data_parallel_buffer_index(
 
     # Sort the fragments so that items with larger sizes come first.
     # When filling the remaining space, prioritize placing the larger fragments first.
-    sorted(fragment_items, key=lambda id_item: -id_item[1].numel())
+    fragment_items.sort(key=lambda id_item: -id_item[1].numel())
 
     # For all bucket parameters, add information on the parameter to the item index map,
     # and add the size of the parameter to the bucket.

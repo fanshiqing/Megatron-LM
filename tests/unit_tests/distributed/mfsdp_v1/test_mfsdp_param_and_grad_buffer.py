@@ -32,6 +32,30 @@ class _ExpertTestModule(torch.nn.Module):
         )
 
 
+@pytest.mark.parametrize("world_size", [4, 64])
+def test_mhc_head_vectors_precede_scalar_fragments(world_size):
+    """Decoder/MTP head vectors must not be packed after interleaved scalar scales."""
+    width = 28672
+    shapes = [torch.Size(shape) for shape in [(4, width), (4, width), (4,), (1,), (4,), (1,)]]
+    indices, bucket, _ = param_and_grad_buffer.build_data_parallel_buffer_index(
+        shapes,
+        data_parallel_rank=0,
+        data_parallel_world_size=world_size,
+        is_data_distributed=True,
+        ddp_config=SimpleNamespace(data_parallel_sharding_strategy="optim_grads_params"),
+        chunk_size_factor=width,
+    )
+    # Triton's vectorized FP32 loads require these four-element bases to be aligned.
+    for item_id in (2, 4):
+        assert indices[item_id].global_data_index * 4 % 16 == 0
+    spans = sorted(
+        (item.global_data_index, item.global_data_index + item.size) for item in indices.values()
+    )
+    assert all(end <= next_start for (_, end), (next_start, _) in zip(spans, spans[1:]))
+    assert spans[-1][1] <= bucket.size
+    assert bucket.size % (world_size * width) == 0
+
+
 def _get_bucket_signatures(module):
     bucket_groups, _, _ = _get_parameter_groups(
         module, BucketingPolicy(suggested_bucket_size=None), meta_device_init_fp8_params={}

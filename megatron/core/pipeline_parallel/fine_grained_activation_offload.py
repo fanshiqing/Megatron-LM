@@ -2,10 +2,15 @@
 
 from collections import defaultdict, deque
 from contextlib import nullcontext
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, NamedTuple, Optional, Tuple
 
 import torch
 from torch.autograd.graph import saved_tensors_hooks
+
+try:
+    from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
+except ImportError:
+    QuantizedTensor = None
 
 from megatron.core.tensor_parallel.random import is_checkpoint_without_output_tensor
 
@@ -822,6 +827,13 @@ class PipelineOffloadManager:
         return self.cur_backward_chunk().tensor_pop(saved_state)
 
 
+class _QuantizedOffloadState(NamedTuple):
+    """Quantized wrapper metadata and offloaded data/scale buffer states."""
+
+    template: Any
+    buffers: list
+
+
 class ChunkOffloadHandler:
     """
     Handles activation offloading and reloading for a single pipeline chunk (microbatch).
@@ -831,6 +843,20 @@ class ChunkOffloadHandler:
     def offload(self, src_tensor, pin_memory=True, use_cpu_pool=True):
         """Offload."""
         debug_rank("--------offload")
+
+        if QuantizedTensor is not None and isinstance(src_tensor, QuantizedTensor):
+            # Preserve quantized bytes/scales and tensor type for backward. Copying
+            # into an ordinary BF16/FP32 tensor silently dequantizes the source.
+            template = src_tensor.detach()
+            buffers, template = template.prepare_for_saving()
+            states = []
+            for buffer in buffers:
+                if buffer is None:
+                    states.append(None)
+                else:
+                    states.append(self.offload(buffer, pin_memory, use_cpu_pool))
+                    buffer.record_stream(torch.cuda.current_stream())
+            return _QuantizedOffloadState(template, states)
 
         if not src_tensor.is_contiguous():
             src_tensor = src_tensor.contiguous()
@@ -849,6 +875,15 @@ class ChunkOffloadHandler:
     def reload(self, state, non_blocking=None):
         """Reload."""
         debug_rank("------reload")
+        if isinstance(state, _QuantizedOffloadState):
+            template, buffer_states = state
+            buffers = [
+                self.reload(buffer_state, non_blocking) if buffer_state is not None else None
+                for buffer_state in buffer_states
+            ]
+            template.restore_from_saved(buffers)
+            return template
+
         dev, cpu_backup, use_cpu_pool = state
         if non_blocking is None:
             non_blocking = cpu_backup.is_pinned()

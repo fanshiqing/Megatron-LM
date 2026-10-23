@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
+import math
 import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, Union
@@ -334,13 +335,15 @@ class OptimizerConfig:
 
     muon_ns_batch_size: int = 1
     """Max number of same-shape matrices fused into one batched Newton-Schulz under
-    muon_tp_mode='layer_sharded'. MoE assigns hundreds of identically shaped expert weights
-    to a single NS home, where the per-matrix loop is kernel-launch bound; batching trades a
-    transient stack of this many matrices for far fewer launches. The value is an upper
-    bound per same-shape bucket, so oversizing it is harmless. Batches of more than one use
-    baddbmm instead of addmm and differ from the per-matrix path by kernel-level rounding,
-    so bitwise parity with duplicated mode is lost; the default of 1 keeps the bit-exact
-    path. Values > 1 require emerging-optimizers >= 0.3.0."""
+    muon_tp_mode='layer_sharded', on each NS home or in a single-rank (GTP_remat x TP)
+    domain. MoE gives such a rank hundreds of identically shaped expert weights, where
+    the per-matrix loop is kernel-launch bound; batching trades transient memory for
+    fewer launches. Local NS inputs and updates are consumed one batch at a time. The
+    value is an upper bound per same-shape bucket, so a value above the matrix count
+    adds no memory. Batches of more than one use baddbmm instead of addmm and differ
+    from the per-matrix path by kernel-level rounding, so bitwise parity with duplicated
+    mode is lost; the default of 1 keeps the bit-exact path. Values > 1 require
+    emerging-optimizers >= 0.3.0."""
 
     muon_expert_tp_mode: Optional[str] = None
     """NS mode for the routed MoE expert weights. None (default): expert weights follow
@@ -597,6 +600,11 @@ class OptimizerConfig:
                 "reuse_grad_buf_for_mxfp8_param_ag."
             )
 
+        if self.optimizer_cuda_graph:
+            assert not math.isfinite(
+                self.grad_norm_skip_threshold
+            ), 'Setting grad_norm_skip_threshold not supported with optimizer CUDA graph'
+
         if self.muon_expert_tp_mode is not None and self.optimizer not in ('muon', 'dist_muon'):
             # Only the muon entry builds one base optimizer per weight family; every other
             # optimizer applies muon_tp_mode to all weights and would ignore the override.
@@ -635,10 +643,6 @@ class OptimizerConfig:
             assert (
                 self.optimizer == 'adam'
             ), '--use-precision-aware-optimizer only supported with adam'
-            assert (
-                self.use_distributed_optimizer
-            ), '--use-precision-aware-optimizer only supported with distributed optimizer'
-
             if not is_te_min_version("2.1.0"):
                 self.store_param_remainders = False
 

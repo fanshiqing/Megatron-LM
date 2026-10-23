@@ -7,6 +7,8 @@ This module owns state that exists only for local CUDA-graph capture and replay:
 * capture-local ownership of asynchronous GTP communication;
 * persistent wgrad ring buffers whose lifetime may cross graph boundaries;
 * routing graph-owned allocations into the shared CUDA-graph memory pool.
+
+The ring allocation helpers also serve persistent eager wgrads.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import logging
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Optional, Self
 
 import torch
 
@@ -28,6 +30,46 @@ from megatron.core.utils import log_single_rank
 logger = logging.getLogger(__name__)
 
 
+@contextmanager
+def preserve_gtp_prefetch_state(params: Iterable[torch.nn.Parameter]):
+    """Preserve cross-graph AG handoffs while a local graph warms up.
+
+    A local graph's first GTP weight can be prefetched and drained by the preceding forward or
+    backward graph. Runner-local warmup consumes that readiness without rerunning the producer,
+    and can create outgoing readiness of its own. Capture must therefore see the same forward and
+    recompute-forward handoff state that existed before each warmup pass. Completed Work handles
+    are intentionally not restored; the producer's external event carries the device dependency.
+    """
+    prefetch_state = tuple(
+        (
+            param,
+            getattr(param, "_already_ag_drained", False),
+            getattr(param, "_recompute_already_drained", False),
+        )
+        for param in params
+        if getattr(param, "is_gtp_weight_remat", False)
+    )
+    completed = False
+    try:
+        yield
+        completed = True
+    finally:
+        leaked_params = []
+        for param, already_drained, recompute_already_drained in prefetch_state:
+            if (
+                getattr(param, "_prefetch_handle", None) is not None
+                or getattr(param, "_recompute_prefetch_handle", None) is not None
+            ):
+                leaked_params.append(getattr(param, "_debug_name", "") or f"id={id(param):#x}")
+            param._already_ag_drained = already_drained
+            param._recompute_already_drained = recompute_already_drained
+
+        # Do not replace an exception from the warmup body with a cleanup failure. On successful
+        # warmup, however, a live Work handle would make the restored host handoff state invalid.
+        if completed and leaked_params:
+            raise RuntimeError("GTP warmup left undrained AG work for: " + ", ".join(leaked_params))
+
+
 @dataclass
 class GraphWgradRingSlot:
     """One persistent wgrad slot guarded by its reduce-scatter completion event."""
@@ -37,22 +79,42 @@ class GraphWgradRingSlot:
     key: tuple
     index: int
 
+    @classmethod
+    def allocate(cls, param, *, key: tuple, index: int = 0) -> Self:
+        """Allocate padded persistent storage; the caller records its initial ready event."""
+        symm = is_gtp_symm_pool_registered(param.group)
+        with gtp_symm_pool_ctx(param.group) if symm else nullcontext():
+            tensor = torch.empty(
+                param._unsharded_shape_padded,
+                dtype=param.main_grad.dtype,
+                device=param.device,
+                memory_format=torch.contiguous_format,
+            )
+        if param.pad_length > 0:
+            tensor.narrow(0, param._unsharded_shape[0], param.pad_length).zero_()
+        return cls(tensor=tensor, ready_event=torch.cuda.Event(external=True), key=key, index=index)
+
 
 @dataclass
 class GTPCaptureCommState:
-    """Asynchronous GTP work issued while capturing one CUDA graph."""
+    """GTP work and parameter-readiness dependencies owned by one capture or warmup pass."""
 
     params: list = field(default_factory=list)
+    params_to_ensure_ready: list = field(default_factory=list)
     ag_streams: list = field(default_factory=list)
     rs_streams: list = field(default_factory=list)
     wgrad_ring_slots: list = field(default_factory=list)
+    finalized_params: list = field(default_factory=list)
     _param_ids: set = field(default_factory=set)
+    _param_ids_to_ensure_ready: set = field(default_factory=set)
     _ag_stream_ids: set = field(default_factory=set)
     _rs_stream_ids: set = field(default_factory=set)
     _wgrad_ring_slot_params: dict = field(default_factory=dict)
+    _comm_records: list[tuple[object, torch.cuda.Stream, bool]] = field(default_factory=list)
 
     def register_comm(self, param, stream: torch.cuda.Stream, *, reduce_scatter: bool) -> None:
-        """Record a parameter and side stream owned by this graph capture."""
+        """Record a parameter and side stream owned by the active capture tracker."""
+        self._comm_records.append((param, stream, reduce_scatter))
         param_id = id(param)
         if param_id not in self._param_ids:
             self._param_ids.add(param_id)
@@ -64,6 +126,46 @@ class GTPCaptureCommState:
         if stream_id not in stream_ids:
             stream_ids.add(stream_id)
             streams.append(stream)
+
+    def register_params_to_ensure_ready(self, params: Iterable) -> None:
+        """Record parameters that must be published before this graph replays."""
+        for param in params:
+            param_id = id(param)
+            if param_id not in self._param_ids_to_ensure_ready:
+                self._param_ids_to_ensure_ready.add(param_id)
+                self.params_to_ensure_ready.append(param)
+
+    def get_comms_for_chain(self, chain_id: str) -> tuple[list, list, list]:
+        """Return owned parameters, AG streams, and RS streams for one GTP chain."""
+        return self.get_comms_for_chains((chain_id,))
+
+    def get_comms_for_chains(
+        self, chain_ids: Iterable[str] | Callable[[str], bool]
+    ) -> tuple[list, list, list]:
+        """Select owned communication by IDs or a predicate, deduplicating shared streams."""
+        matches_chain = chain_ids if callable(chain_ids) else set(chain_ids).__contains__
+        params = []
+        ag_streams = []
+        rs_streams = []
+        param_ids = set()
+        ag_stream_ids = set()
+        rs_stream_ids = set()
+
+        for param, stream, reduce_scatter in self._comm_records:
+            chain_id = getattr(param, "chain_id", None)
+            if chain_id is None or not matches_chain(chain_id):
+                continue
+            if id(param) not in param_ids:
+                param_ids.add(id(param))
+                params.append(param)
+
+            streams = rs_streams if reduce_scatter else ag_streams
+            stream_ids = rs_stream_ids if reduce_scatter else ag_stream_ids
+            if id(stream) not in stream_ids:
+                stream_ids.add(id(stream))
+                streams.append(stream)
+
+        return params, ag_streams, rs_streams
 
     def register_wgrad_ring_slot(self, slot: GraphWgradRingSlot, param) -> None:
         """Track slots used by this graph and reject unsafe intra-graph aliasing."""
@@ -79,6 +181,12 @@ class GTPCaptureCommState:
             self._wgrad_ring_slot_params[slot_id] = param_id
             self.wgrad_ring_slots.append(slot)
 
+    def register_wgrad_finalize(self, param) -> None:
+        """Record one DDP grad-ready occurrence produced by GRAPHED GTP finalization."""
+        # Repeated uses of one parameter must remain repeated: DDP learns the expected ready
+        # count during eager execution, and CUDA graph replay must reproduce that count.
+        self.finalized_params.append(param)
+
 
 _ACTIVE_CAPTURE_COMM_STATE: Optional[GTPCaptureCommState] = None
 
@@ -89,6 +197,18 @@ def register_capture_comm(param, stream: torch.cuda.Stream, *, reduce_scatter: b
         _ACTIVE_CAPTURE_COMM_STATE.register_comm(param, stream, reduce_scatter=reduce_scatter)
 
 
+def register_capture_wgrad_finalize(param) -> None:
+    """Record one GRAPHED GTP wgrad-finalization occurrence with the active capture."""
+    if _ACTIVE_CAPTURE_COMM_STATE is not None:
+        _ACTIVE_CAPTURE_COMM_STATE.register_wgrad_finalize(param)
+
+
+def register_capture_params_to_ensure_ready(params: Iterable) -> None:
+    """Record GTP parameter reads that need publication before graph replay."""
+    if _ACTIVE_CAPTURE_COMM_STATE is not None:
+        _ACTIVE_CAPTURE_COMM_STATE.register_params_to_ensure_ready(params)
+
+
 def register_capture_wgrad_ring_slot(slot: GraphWgradRingSlot, param) -> None:
     """Register a ring slot with the active capture, if one exists."""
     if _ACTIVE_CAPTURE_COMM_STATE is not None:
@@ -97,7 +217,12 @@ def register_capture_wgrad_ring_slot(slot: GraphWgradRingSlot, param) -> None:
 
 @contextmanager
 def track_gtp_capture_comms():
-    """Track asynchronous GTP work owned by one CUDA-graph capture."""
+    """Track asynchronous GTP work issued during one capture or warmup pass.
+
+    This context tracks ownership, not graph-chain membership. Nested modules can issue work for
+    ``UNGRAPHED`` parameters while the context is active, so callers implementing the cross-graph
+    handoff must explicitly select the ``GRAPHED`` parameters and their corresponding streams.
+    """
     global _ACTIVE_CAPTURE_COMM_STATE
 
     if _ACTIVE_CAPTURE_COMM_STATE is not None:
@@ -114,6 +239,35 @@ def track_gtp_capture_comms():
 # Slots live outside the shared graph pool so independently replayed graphs cannot reuse an
 # in-flight reduce-scatter input as temporary workspace.
 _GRAPH_WGRAD_RINGS: dict[tuple, list[GraphWgradRingSlot]] = {}
+
+
+def wgrad_ring_key(param, stream_key: Callable[[str, object], tuple]) -> tuple:
+    """Keep scheduling domains, grouped FC roles, experts and padding layouts distinct."""
+    return (
+        stream_key(param.chain_id, param.group),
+        param.chain_id,
+        param._unsharded_shape,
+        param._unsharded_shape_padded,
+        param.main_grad.dtype,
+        param.expert_idx,
+    )
+
+
+def allocate_wgrad_ring(
+    matching_params: list, *, key: tuple, ring_size: int, slot_type: type[GraphWgradRingSlot]
+) -> list[GraphWgradRingSlot]:
+    """Allocate bounded stable storage for either mode; callers bind writers to slots."""
+    slot_count = min(ring_size, len(matching_params))
+    exemplar = matching_params[0]
+    assert all(p.group is exemplar.group for p in matching_params), (
+        "GTP wgrad ring slots are allocated from the exemplar's symmetric pool, so "
+        "every param sharing a ring key must share its process group"
+    )
+    slots = [slot_type.allocate(exemplar, key=key, index=i) for i in range(slot_count)]
+    # Publish the allocation's zero padding before a writer on another stream can use it.
+    for slot in slots:
+        slot.ready_event.record()
+    return slots
 
 
 def allocate_graph_wgrad_rings(
@@ -150,14 +304,7 @@ def allocate_graph_wgrad_rings(
                 raise RuntimeError(
                     "GTP wgrad rings must be initialized after DDP creates param.main_grad"
                 )
-            key = (
-                stream_key(param.chain_id, param.group),
-                param.chain_id,  # FC1/FC2 can be owned by the same graph; do not alias their rings.
-                param._unsharded_shape,
-                param._unsharded_shape_padded,
-                param.main_grad.dtype,
-                param.expert_idx,
-            )
+            key = wgrad_ring_key(param, stream_key)
             params_by_key[key].append(param)
 
     # Symm-RS: GRAPHED chains send their persistent ring slot directly, so allocating the
@@ -168,38 +315,15 @@ def allocate_graph_wgrad_rings(
     buffer_count = 0
     new_slots = []
     for key, matching_params in params_by_key.items():
-        slot_count = min(ring_size, len(matching_params))
-        slots = []
-        exemplar = matching_params[0]
-        assert all(p.group is exemplar.group for p in matching_params), (
-            "GTP wgrad ring slots are allocated from the exemplar's symmetric pool, so "
-            "every param sharing a ring key must share its process group"
+        slots = allocate_wgrad_ring(
+            matching_params, key=key, ring_size=ring_size, slot_type=GraphWgradRingSlot
         )
-        symm = is_gtp_symm_pool_registered(exemplar.group)
-        for slot_index in range(slot_count):
-            with gtp_symm_pool_ctx(exemplar.group) if symm else nullcontext():
-                tensor = torch.empty(
-                    exemplar._unsharded_shape_padded,
-                    dtype=exemplar.main_grad.dtype,
-                    device=exemplar.device,
-                    memory_format=torch.contiguous_format,
-                )
-            if exemplar.pad_length > 0:
-                tensor.narrow(0, exemplar._unsharded_shape[0], exemplar.pad_length).zero_()
-            slot = GraphWgradRingSlot(
-                tensor=tensor,
-                ready_event=torch.cuda.Event(external=True),
-                key=key,
-                index=slot_index,
-            )
-            slots.append(slot)
-            new_slots.append(slot)
-            total_bytes += tensor.numel() * tensor.element_size()
-            buffer_count += 1
-
+        new_slots.extend(slots)
+        total_bytes += sum(slot.tensor.numel() * slot.tensor.element_size() for slot in slots)
+        buffer_count += len(slots)
         _GRAPH_WGRAD_RINGS[key] = slots
         for param_index, param in enumerate(matching_params):
-            slot = slots[param_index % slot_count]
+            slot = slots[param_index % len(slots)]
             param._gtp_graph_wgrad_ring_slot = slot
             if param.pad_length > 0:
                 param._gtp_graph_wgrad_ring_view = slot.tensor.narrow(
@@ -208,10 +332,7 @@ def allocate_graph_wgrad_rings(
             else:
                 param._gtp_graph_wgrad_ring_view = slot.tensor
 
-    # Initially every slot is available. Later generations are recorded on the RS stream after NCCL
-    # has finished reading the slot.
-    for slot in new_slots:
-        slot.ready_event.record()
+    # Complete initial readiness events before capture/replay may wait on them.
     if new_slots:
         torch.cuda.current_stream().synchronize()
 

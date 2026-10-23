@@ -1377,3 +1377,99 @@ def pixel_shuffle(x, scale_factor=0.5, version=2, h=None, w=None):
     x = x.reshape(x.shape[0], -1, x.shape[-1])
 
     return x
+
+
+def _pixel_shuffle_canonical_spatial(x, scale_factor=0.5, version=2, h=None, w=None):
+    """Spatially group neighboring vision patches following the InternVL convention.
+
+    This is the canonical MCore LLaVA ordering: for a 0.5 scale, each output
+    token concatenates one spatial 2x2 neighborhood, including on non-square
+    grids. Explicit ``h`` and ``w`` must therefore both be divisible by the
+    reduction factor. The MIMO RADIO provider retains an equivalent local
+    implementation of this ordering.
+
+    Args:
+        x (torch.Tensor): Vision model outputs [num_tiles, img_seq_len, h_vision]
+        version (int): Implementation version.
+        h (int, optional): Height in patches for non-square grids.
+        w (int, optional): Width in patches for non-square grids.
+
+    Returns:
+        Shuffled vision model outputs [num_tiles, (sq ** 2) * (scale ** 2), h_vision / (scale ** 2)]
+    """
+    if h is not None or w is not None:
+        assert h is not None and w is not None, "h and w must both be provided"
+        assert h * w == x.shape[1], f"h*w ({h}*{w}={h * w}) must equal patches ({x.shape[1]})"
+        reduction = int(1 / scale_factor)
+        assert (
+            h % reduction == 0 and w % reduction == 0
+        ), f"h and w ({h}, {w}) must both be divisible by {reduction}"
+    else:
+        h = w = int(x.shape[1] ** 0.5)
+    x = x.reshape(x.shape[0], h, w, -1)  # [num_tiles, sq, sq, h_vision]
+
+    n, w, h, c = x.size()
+    # N, W, H, C --> N, W, H * scale, C // scale
+    x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
+    # N, W, H * scale, C // scale --> N, H * scale, W, C // scale
+    x = x.permute(0, 2, 1, 3).contiguous()
+    # N, H * scale, W, C // scale --> N, H * scale, W * scale, C // (scale ** 2)
+    x = x.view(
+        n, int(h * scale_factor), int(w * scale_factor), int(c / (scale_factor * scale_factor))
+    )
+
+    if version == 2:
+        x = x.permute(0, 2, 1, 3).contiguous()
+
+    x = x.reshape(x.shape[0], -1, x.shape[-1])
+
+    return x
+
+
+def _pixel_shuffle_dynamic_resolution_chunks(
+    chunks, image_sizes, patch_dim, scale_factor=0.5, version=2
+):
+    """Pixel-shuffle dynamic-resolution chunks using their real patch grids."""
+    assert len(chunks) == len(image_sizes), "each image chunk requires a matching image size"
+    shuffled_chunks = []
+    for chunk, (height, width) in zip(chunks, image_sizes):
+        restore_2d = chunk.ndim == 2
+        if restore_2d:
+            chunk = chunk.unsqueeze(0)
+        shuffled = _pixel_shuffle_canonical_spatial(
+            chunk,
+            scale_factor=scale_factor,
+            version=version,
+            h=int(height) // int(patch_dim),
+            w=int(width) // int(patch_dim),
+        )
+        shuffled_chunks.append(shuffled.squeeze(0) if restore_2d else shuffled)
+    return shuffled_chunks
+
+
+def pixel_shuffle_dynamic_res(x, imgs_sizes, patch_dim, scale_factor=0.5, version=2):
+    """Pixel shuffle for dynamic resolution (variable tile sizes).
+
+    Splits the packed sequence by per-tile lengths, applies pixel shuffle to each tile,
+    then re-concatenates using :func:`pixel_shuffle`'s canonical spatial-neighborhood
+    ordering.
+
+    Args:
+        x (torch.Tensor): Vision model outputs [batch, total_seq_len, h_vision]
+        imgs_sizes (torch.Tensor): Per-tile (H, W) pixel sizes [num_tiles, 2]
+        patch_dim (int): Patch size used by the vision encoder
+        scale_factor (float): Pixel shuffle scale factor
+        version (int): Implementation version
+
+    Returns:
+        x (torch.Tensor): Shuffled outputs [batch, total_shuffled_seq_len, h_vision / (scale**2)]
+    """
+    seq_lens = torch.prod(imgs_sizes // patch_dim, dim=-1)
+    splits = torch.split(x, seq_lens.tolist(), dim=-2)
+
+    sizes = imgs_sizes.tolist() if torch.is_tensor(imgs_sizes) else list(imgs_sizes)
+    out = _pixel_shuffle_dynamic_resolution_chunks(
+        splits, sizes, patch_dim, scale_factor=scale_factor, version=version
+    )
+    x = torch.cat(out, dim=-2)
+    return x

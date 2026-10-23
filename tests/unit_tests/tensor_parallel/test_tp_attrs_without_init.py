@@ -135,6 +135,24 @@ def test_copy_gtp_attributes_preserves_pad_length():
     assert destination.pad_length == 3
 
 
+def test_copy_gtp_attributes_preserves_pad_length():
+    # The optimizer's fp32 main-param / distributed-optimizer shard copies rely on
+    # copy_gtp_attributes to carry GTP_remat metadata forward from the model param;
+    # pad_length must reach those copies or GTP_remat-aware orthogonalization silently
+    # falls back to pad_length=0 on the optimizer-owned param.
+    source = torch.empty(4, 4)
+    destination = torch.empty_like(source)
+    source.is_gtp_weight_remat = True
+    source.allreduce = False
+    source.pad_length = 3
+
+    copy_gtp_attributes(destination, source)
+
+    assert destination.is_gtp_weight_remat is True
+    assert destination.allreduce is False
+    assert destination.pad_length == 3
+
+
 def test_non_allreduce_param_uses_expert_tp_group_for_duplicate_filter():
     class RankGroup:
         def __init__(self, rank):

@@ -88,7 +88,7 @@ def _make_muon(pg_collection, tp_mode="distributed"):
 
 
 def _full_weight(rows=_M):
-    """Full [M, K] momentum, identical on every rank (rank-0 broadcast)."""
+    """Full [rows, _K] momentum, identical on every rank (rank-0 broadcast)."""
     torch.manual_seed(0)
     w = torch.randn(rows, _K, dtype=torch.float32, device="cuda")
     torch.distributed.broadcast(w, src=0)

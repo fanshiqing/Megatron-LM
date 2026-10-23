@@ -2,7 +2,7 @@
 
 import contextlib
 from functools import partial
-from itertools import zip_longest
+from itertools import chain, zip_longest
 from typing import Callable, Dict, Iterator, List, Optional, Union
 
 import torch
@@ -40,6 +40,11 @@ from .combined_1f1b import (
     combined_1f1b_schedule_for_interleaved_pipelining,
     combined_1f1b_schedule_for_no_pipelining,
 )
+
+try:
+    from nemo.lens.helpers import trace_fn as _otel_trace_fn
+except ImportError:
+    from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -271,13 +276,24 @@ def _get_mtp_loss_scale(config, device: torch.device) -> torch.Tensor:
     return _compute_loss_scale(config, device)
 
 
+def _set_mtp_loss_scale(config, device: torch.device, num_microbatches: int) -> None:
+    """Publish the MTP loss scale so MTP backward (deferred or early) matches the main loss."""
+    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+
+    loss_scale = _get_mtp_loss_scale(config, device)
+    if config.calculate_per_token_loss:
+        MTPLossAutoScaler.set_loss_scale(loss_scale)
+    else:
+        MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+
+
 def _get_experimental_attention_variant_loss_scale_func(config):
     """Get the loss scale hook for experimental attention variants."""
     loss_scale_func = getattr(config, 'experimental_attention_variant_loss_scale_func', None)
     if loss_scale_func is not None:
         return loss_scale_func
 
-    if getattr(config, 'experimental_attention_variant', None) == 'dsa':
+    if getattr(config, 'experimental_attention_variant', None) in ('dsa', 'dsv4_hybrid'):
         from megatron.core.transformer.experimental_attention_variant.dsa import (
             DSAIndexerLossAutoScaler,
         )
@@ -300,8 +316,6 @@ def forward_step_calc_loss(
     is_last_stage=None,
 ):
     """Calculate the loss and number of tokens for forward_step()"""
-
-    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     model_vp_stage = getattr(model, "vp_stage", None)
     if vp_stage is not None and model_vp_stage is not None:
@@ -366,13 +380,7 @@ def forward_step_calc_loss(
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
         # Calculate the loss scale based on mtp_grad_scale_func if available,
         # else fall back to grad_scale_func, else default to 1.
-        device = get_tensor_device(output_tensor)
-        loss_scale = _get_mtp_loss_scale(config, device)
-        # Set the loss scale
-        if config.calculate_per_token_loss:
-            MTPLossAutoScaler.set_loss_scale(loss_scale)
-        else:
-            MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+        _set_mtp_loss_scale(config, get_tensor_device(output_tensor), num_microbatches)
 
     # Set the loss scale for any experimental attention-variant auxiliary loss.
     experimental_attention_variant_loss_scale_func = (
@@ -396,6 +404,7 @@ def forward_step_calc_loss(
     return output_tensor, num_tokens
 
 
+@_otel_trace_fn('microbatch', 'megatron.microbatch.forward')
 def forward_step(
     forward_step_func,
     data_iterator,
@@ -484,7 +493,6 @@ def forward_step(
         Tensor or list[Tensor]: The output object(s) from the forward step.
         Tensor: The number of tokens.
     """
-    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
@@ -501,6 +509,18 @@ def forward_step(
 
     set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
     set_input_tensor(input_tensor)
+
+    # With mtp_loss_early_backward the MTP heads run their backward inside the forward pass,
+    # so the MTP loss scale must already be current before the model is called. The scale is
+    # refreshed again after the forward (below) for the deferred path.
+    if (
+        getattr(config, 'mtp_num_layers', None) is not None
+        and getattr(config, 'mtp_loss_early_backward', False)
+        and torch.cuda.is_available()
+    ):
+        _set_mtp_loss_scale(
+            config, torch.device('cuda', torch.cuda.current_device()), num_microbatches
+        )
 
     if config.enable_autocast:
         context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
@@ -531,6 +551,7 @@ def forward_step(
     return [output_tensor], num_tokens
 
 
+@_otel_trace_fn('microbatch', 'megatron.microbatch.backward')
 def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     """Backward step through passed-in output tensor.
 
@@ -704,6 +725,17 @@ def _build_default_pg_collection() -> ProcessGroupCollection:
     return pg_collection
 
 
+def _reset_activation_offload(
+    pg_collection: Union[ProcessGroupCollection, MultiModuleProcessGroupCollection],
+) -> None:
+    """Reset activation offload state for single-model and MIMO language ranks."""
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        if not pg_collection.has_language_model():
+            return
+        pg_collection = pg_collection.get_language_model_collection()
+    off_interface.reset(process_group=pg_collection.tp_dp_cp)
+
+
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -837,7 +869,7 @@ def forward_backward_no_pipelining(
         )
 
     if getattr(config, 'fine_grained_activation_offloading', False):
-        off_interface.reset()
+        _reset_activation_offload(pg_collection)
     # Reset all_gather_pipeline bucket status before next validation iteration
     if forward_only:
         for model_chunk in [model]:
@@ -2207,7 +2239,7 @@ def forward_backward_pipelining_with_interleaving(
         )
 
     if getattr(config, 'fine_grained_activation_offloading', False):
-        off_interface.reset()
+        _reset_activation_offload(pg_collection)
     # Restore config.grad_sync_func and config.param_sync_func.
     if forward_only:
         config.grad_sync_func, config.param_sync_func = grad_sync_func, param_sync_func
@@ -2220,6 +2252,20 @@ def forward_backward_pipelining_with_interleaving(
     nvtx_range_pop(suffix="misc")
 
     return forward_data_store
+
+
+def _get_pipeline_hidden_size(config) -> int:
+    """Return the residual width carried across every logical pipeline boundary.
+
+    Supported mHC layouts expand at pre_process and contract at post_process.
+    GPTModel rejects mHC with PP and MTP, where the decoder can contract earlier.
+    All communicating stages therefore carry every residual stream, including
+    the last physical rank sending to the next virtual chunk on the first rank.
+    """
+    hidden_size = config.hidden_size
+    if config.pipeline_model_parallel_size > 1 and getattr(config, "enable_mhc_connections", False):
+        hidden_size *= config.mhc_num_residual_streams
+    return hidden_size
 
 
 def get_tensor_shapes(
@@ -2296,6 +2342,18 @@ def get_tensor_shapes(
     return tensor_shapes
 
 
+def _prepare_forward_data_iterator(data_iterator, p2p_communicator, *, is_multimodule: bool):
+    """Prepare a batch-derived bridge shape without advancing the logical batch."""
+    if not is_multimodule or not p2p_communicator.has_receiver_derived_bridge_shapes:
+        return data_iterator
+    if data_iterator is None:
+        raise RuntimeError("batch-derived bridge shapes require a data iterator")
+
+    batch = next(data_iterator)
+    p2p_communicator.prepare_bridge_recv_shapes(batch)
+    return chain((batch,), data_iterator)
+
+
 def forward_backward_pipelining_without_interleaving(
     *,
     forward_step_func,
@@ -2328,7 +2386,6 @@ def forward_backward_pipelining_without_interleaving(
             len(data_iterator) == 1
         ), "non-interleaved pipeline-parallel schedule does not support model chunking"
         data_iterator = data_iterator[0]
-
     config = get_model_config(model)
     if config.overlap_p2p_comm:
         raise ValueError(
@@ -2395,6 +2452,9 @@ def forward_backward_pipelining_without_interleaving(
     else:
         raise ValueError("Provide both p2p_communicator and pg_collection, or neither")
 
+    if is_multimodule:
+        p2p_communicator.set_forward_only(forward_only)
+
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
         embedding_module = clear_embedding_activation_buffer(
@@ -2428,6 +2488,13 @@ def forward_backward_pipelining_without_interleaving(
             no_sync_context = None
 
     disable_grad_sync()
+
+    grad_sync_first_stage = p2p_communicator.is_pp_first_stage
+    if isinstance(p2p_communicator, MultiModulePipelineCommunicator):
+        grad_sync_first_stage = all(
+            p2p_communicator.is_module_pp_first_stage(module_name)
+            for module_name in p2p_communicator.rank_module_map
+        )
 
     # Compute number of warmup microbatches.
     num_warmup_microbatches = p2p_communicator.total_stages - p2p_communicator.current_stage - 1
@@ -2501,12 +2568,15 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        forward_data_iterator = _prepare_forward_data_iterator(
+            data_iterator, p2p_communicator, is_multimodule=is_multimodule
+        )
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
         output_tensor, num_tokens = forward_step(
             forward_step_func,
-            data_iterator,
+            forward_data_iterator,
             model,
             num_microbatches,
             input_tensor,
@@ -2531,6 +2601,9 @@ def forward_backward_pipelining_without_interleaving(
     # If all microbatches are run in warmup / cooldown phase, then no need to
     # receive this tensor here.
     if num_microbatches_remaining > 0:
+        forward_data_iterator = _prepare_forward_data_iterator(
+            data_iterator, p2p_communicator, is_multimodule=is_multimodule
+        )
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
@@ -2549,7 +2622,7 @@ def forward_backward_pipelining_without_interleaving(
 
         output_tensor, num_tokens = forward_step(
             forward_step_func,
-            data_iterator,
+            forward_data_iterator,
             model,
             num_microbatches,
             input_tensor,
@@ -2569,6 +2642,9 @@ def forward_backward_pipelining_without_interleaving(
         if forward_only:
             p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
             if not last_iteration:
+                forward_data_iterator = _prepare_forward_data_iterator(
+                    data_iterator, p2p_communicator, is_multimodule=is_multimodule
+                )
                 input_tensor = p2p_communicator.recv_forward(
                     recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
@@ -2590,7 +2666,7 @@ def forward_backward_pipelining_without_interleaving(
             # Enable grad sync for the last microbatch in the batch if the full
             # backward pass completes in the 1F1B stage.
             if num_warmup_microbatches == 0 and last_iteration:
-                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
+                if config.grad_sync_func is None or grad_sync_first_stage:
                     enable_grad_sync()
 
             input_tensor_grad = backward_func(
@@ -2603,6 +2679,9 @@ def forward_backward_pipelining_without_interleaving(
                     input_tensor_grad, p2p_communicator.is_pp_first_stage
                 )
             else:
+                forward_data_iterator = _prepare_forward_data_iterator(
+                    data_iterator, p2p_communicator, is_multimodule=is_multimodule
+                )
                 input_tensor = p2p_communicator.send_backward_recv_forward(
                     input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
@@ -2617,7 +2696,7 @@ def forward_backward_pipelining_without_interleaving(
             # pipeline stages do grad reduction during pipeline
             # bubble.
             if i == num_warmup_microbatches - 1:
-                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
+                if config.grad_sync_func is None or grad_sync_first_stage:
                     enable_grad_sync()
 
             input_tensor = input_tensors.pop(0)
@@ -2658,7 +2737,7 @@ def forward_backward_pipelining_without_interleaving(
         )
 
     if getattr(config, 'fine_grained_activation_offloading', False):
-        off_interface.reset()
+        _reset_activation_offload(pg_collection)
 
     if config.timers is not None:
         config.timers('forward-backward').stop()

@@ -14,6 +14,7 @@ from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
 from megatron.core.transformer.moe.moe_utils import (
     get_default_pg_collection,
+    get_tokens_per_expert_and_token_count,
     get_updated_expert_bias,
     router_gating_linear,
     topk_routing_with_score_function,
@@ -965,3 +966,73 @@ class TestHashRouting:
         output.sum().backward()
         assert hidden_states.grad is not None
         assert not torch.isnan(hidden_states.grad).any()
+
+
+def test_token_count_reduction_keeps_local_count_with_in_place_reduce(monkeypatch):
+    """The TP reduction all-reduces contiguous tensors in place. Local valid-token
+    counts must stay per-rank; otherwise downstream per-token-loss scaling re-reduces
+    an already-global count (2x at runtime CP2)."""
+    import megatron.core.tensor_parallel.mappings as mappings
+
+    class _Group:
+        def size(self):
+            return 2
+
+    cp_group = _Group()
+    # The peer CP rank holds 2 valid tokens (one per expert); this rank holds 1.
+    peer_tokens_per_expert = torch.tensor([1, 1])
+
+    def _in_place_all_reduce(tensor, group=None):
+        assert group is cp_group
+        tensor.add_(peer_tokens_per_expert)
+
+    # Drive the real reduce_from_tensor_model_parallel_region -> _reduce path and fake
+    # only the collective, preserving its in-place semantics.
+    monkeypatch.setattr(mappings, "get_tensor_model_parallel_group_if_none", lambda g: g)
+    monkeypatch.setattr(torch.distributed, "all_reduce", _in_place_all_reduce)
+    routing_map = torch.tensor([[True, False], [False, False]])  # second token is padding
+
+    tokens_per_expert, local_tokens, total_tokens = get_tokens_per_expert_and_token_count(
+        routing_map, reduce_group=cp_group, topk=1, with_padding_mask=True
+    )
+
+    assert torch.equal(tokens_per_expert, torch.tensor([2, 1]))
+    assert local_tokens == 1
+    assert total_tokens == 3
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
+@pytest.mark.parametrize("use_pre_softmax", [True, False])
+@pytest.mark.parametrize("topk", [1, 2])
+def test_topk_routing_precomputed_indices_equivalence(score_function, use_pre_softmax, topk):
+    """Passing precomputed_indices that match the function's own selection must reproduce
+    the standard output. Guards the shared post-top-k path reused by quantile balancing."""
+    if score_function != "softmax" and use_pre_softmax:
+        pytest.skip("pre_softmax only applies to softmax scoring")
+
+    torch.manual_seed(123)
+    num_tokens, num_experts = 64, 8
+    logits = torch.randn(num_tokens, num_experts)
+
+    kwargs = dict(use_pre_softmax=use_pre_softmax, score_function=score_function, fused=False)
+    probs_ref, map_ref = topk_routing_with_score_function(logits, topk, **kwargs)
+    _, top_indices = topk_routing_with_score_function(logits, topk, dense_output=True, **kwargs)
+    probs_pre, map_pre = topk_routing_with_score_function(
+        logits, topk, precomputed_indices=top_indices, **kwargs
+    )
+
+    # Natural top-k indices reproduce the standard output.
+    assert torch.equal(map_ref, map_pre)
+    torch.testing.assert_close(probs_ref, probs_pre)
+
+    # Indices that differ from the natural top-k must route to exactly those experts. This
+    # catches a regression where the precomputed_indices branch is dropped and the function
+    # silently recomputes its own top-k instead of honoring the caller's indices. Bottom-k is
+    # disjoint from top-k since 2 * topk <= num_experts.
+    alt_indices = logits.topk(topk, dim=1, largest=False).indices
+    _, map_alt = topk_routing_with_score_function(
+        logits, topk, precomputed_indices=alt_indices, **kwargs
+    )
+    expected_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, alt_indices, True)
+    assert torch.equal(map_alt, expected_map)

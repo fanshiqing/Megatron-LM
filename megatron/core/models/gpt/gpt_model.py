@@ -68,6 +68,8 @@ class GPTModel(LanguageModule):
             Include an output layer (used with pipeline parallelism). Defaults to True.
         fp16_lm_cross_entropy (bool, optional):
             Defaults to False.
+        logit_dtype (torch.dtype, optional):
+            Output-layer GEMM dtype; None keeps the hidden-state dtype.
         parallel_output (bool, optional):
             Do not gather the outputs, keep them split across tensor
             parallel ranks. Defaults to True.
@@ -116,6 +118,7 @@ class GPTModel(LanguageModule):
         mtp_block_spec: Optional[ModuleSpec] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        logit_dtype: Optional[torch.dtype] = None,
     ) -> None:
         log_single_rank(
             logger,
@@ -124,6 +127,13 @@ class GPTModel(LanguageModule):
             "features. Please reference the migration guide "
             "`docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`",
         )
+        if (
+            logit_dtype is not None
+            and config.cross_entropy_loss_fusion
+            and config.cross_entropy_fusion_impl == "linear"
+        ):
+            raise ValueError("logit_dtype is not supported with fused linear cross entropy.")
+
         super().__init__(config=config, pg_collection=pg_collection)
 
         if has_config_logger_enabled(config):
@@ -135,6 +145,7 @@ class GPTModel(LanguageModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
+        self.logit_dtype = logit_dtype
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.vp_stage = vp_stage
@@ -299,6 +310,7 @@ class GPTModel(LanguageModule):
                 embedding_activation_buffer=self.embedding_activation_buffer,
                 grad_output_buffer=self.grad_output_buffer,
                 tp_group=self.pg_collection.tp,
+                output_dtype=self.logit_dtype,
             )
 
         if self.pre_process or self.post_process or self.mtp_process:

@@ -3,6 +3,7 @@
 
 
 """Sample Generate GPT"""
+
 import json
 import os
 import sys

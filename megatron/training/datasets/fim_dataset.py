@@ -1,10 +1,11 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-from typing import Dict, Tuple, Optional
+import logging
 from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple
 
 import numpy as np
-import logging
+
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.utils import Split

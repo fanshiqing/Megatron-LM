@@ -17,10 +17,15 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
+from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.dist_signal_handler import DistributedSignalHandler
+from megatron.training.state import TrainState
 
 _GLOBAL_ARGS = None
+_GLOBAL_RUNTIME_INITIALIZED = False
+_GLOBAL_RUN_CONFIG = None
+_GLOBAL_TRAIN_STATE = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_WANDB_WRITER = None
@@ -35,6 +40,76 @@ def get_args():
     """Return arguments."""
     _ensure_var_is_initialized(_GLOBAL_ARGS, 'args')
     return _GLOBAL_ARGS
+
+
+class _LegacyTrainState(TrainState):
+    """Live state view while the dev training loop still owns progress through args.
+
+    Do not snapshot values on access: main utilities may mutate this object. All fields
+    write through to the same argument namespace; resume FLOPs stays separate from the
+    cumulative counter used by the running loop.
+    """
+
+    _arg_fields = {
+        "iteration": "_current_train_iteration",
+        "resume_iteration": "iteration",
+        "num_floating_point_operations_so_far": "_current_floating_point_operations",
+        "resume_num_floating_point_operations": "num_floating_point_operations_so_far",
+    }
+
+    def __init__(self, args):
+        object.__setattr__(self, "_args", args)
+        if not hasattr(args, "_current_train_iteration"):
+            args._current_train_iteration = getattr(args, "iteration", 0)
+        if not hasattr(args, "_current_floating_point_operations"):
+            args._current_floating_point_operations = getattr(
+                args, "num_floating_point_operations_so_far", 0
+            )
+
+    def __getattribute__(self, name):
+        fields = TrainState.__dataclass_fields__
+        if name in fields:
+            args = object.__getattribute__(self, "_args")
+            key = type(self)._arg_fields.get(name, name)
+            return getattr(args, key, fields[name].default)
+        return object.__getattribute__(self, name)
+
+    def __setattr__(self, name, value):
+        if name in TrainState.__dataclass_fields__:
+            setattr(self._args, self._arg_fields.get(name, name), value)
+        else:
+            object.__setattr__(self, name, value)
+
+
+def get_run_config():
+    """Return the stored config, adapting legacy initialization when necessary."""
+    global _GLOBAL_RUN_CONFIG
+    if _GLOBAL_RUN_CONFIG is None:
+        from megatron.training.argument_utils import pretrain_cfg_container_from_args
+
+        _GLOBAL_RUN_CONFIG = pretrain_cfg_container_from_args(get_args())
+    return _GLOBAL_RUN_CONFIG
+
+
+def is_run_config_initialized():
+    return _GLOBAL_RUN_CONFIG is not None
+
+
+def set_run_config(cfg_container):
+    global _GLOBAL_RUN_CONFIG
+    _GLOBAL_RUN_CONFIG = cfg_container
+
+
+def get_train_state():
+    global _GLOBAL_TRAIN_STATE
+    if _GLOBAL_TRAIN_STATE is None and _GLOBAL_ARGS is not None:
+        _GLOBAL_TRAIN_STATE = _LegacyTrainState(_GLOBAL_ARGS)
+    return _GLOBAL_TRAIN_STATE
+
+
+def get_telemetry():
+    """Telemetry services are not initialized by the retained dev runtime."""
+    return None
 
 
 def get_tokenizer():
@@ -121,13 +196,28 @@ def _graceful_shutdown(signum, frame):
     sys.exit(0)
 
 
-def set_global_variables(args, build_tokenizer=True):
+def is_global_variables_initialized():
+    """Whether runtime services have been constructed, independently of CLI registration."""
+    return _GLOBAL_RUNTIME_INITIALIZED
+
+
+def set_global_variables(args, cfg_container=None, build_tokenizer=True):
     """Set args, tokenizer, tensorboard-writer, adlr-autoresume, and timers."""
 
+    if isinstance(cfg_container, bool):
+        build_tokenizer, cfg_container = cfg_container, None
+    if cfg_container is not None:
+        set_run_config(cfg_container)
     assert args is not None
 
-    _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
-    set_args(args)
+    global _GLOBAL_RUNTIME_INITIALIZED
+    assert not _GLOBAL_RUNTIME_INITIALIZED, 'global runtime services are already initialized'
+    if _GLOBAL_ARGS is None:
+        set_args(args)
+    else:
+        assert _GLOBAL_ARGS is args, 'runtime args must match the registered argument namespace'
+
+    _resolve_runtime_batch_defaults(args)
 
     if args.step_batch_size_schedule is not None:
         print(f'> using step batch size schedule: {args.step_batch_size_schedule}')
@@ -136,14 +226,16 @@ def set_global_variables(args, build_tokenizer=True):
         rank=args.rank,
         global_batch_size=args.global_batch_size,
         micro_batch_size=args.micro_batch_size,
-        # Full DP x gtp_remat degree (args.data_parallel_size is the gtp_remat-excluded replicate).
-        data_parallel_size=args.data_parallel_size * args.gtp_weight_remat_size,
+        # Sequence-sharding GTP ranks do not introduce independent batch partitions.
+        data_parallel_size=get_batch_parallel_size(args),
         decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
         step_batch_size_schedule=args.step_batch_size_schedule,
         seq_length=args.seq_length,
     )
+    _finalize_runtime_config(args)
     if build_tokenizer:
         _ = _build_tokenizer(args)
+        _bind_tokenizer_vocab_to_run_config(args)
     _set_tensorboard_writer(args)
     _set_wandb_writer(args)
     _set_one_logger(args)
@@ -164,6 +256,8 @@ def set_global_variables(args, build_tokenizer=True):
     if args.disable_jit_fuser:
         disable_jit_fuser()
 
+    _GLOBAL_RUNTIME_INITIALIZED = True
+
 
 def unset_global_variables():
     """Unset global vars.
@@ -171,6 +265,7 @@ def unset_global_variables():
     Useful for multiple runs. See `tests/unit_tests/ckpt_converter/test_ckpt_converter.py` for an example.
     """
 
+    global _GLOBAL_RUN_CONFIG, _GLOBAL_TRAIN_STATE, _GLOBAL_RUNTIME_INITIALIZED
     global _GLOBAL_ARGS
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
     global _GLOBAL_TOKENIZER
@@ -182,6 +277,9 @@ def unset_global_variables():
     global _GLOBAL_ENERGY_MONITOR
     global _GLOBAL_SIGNAL_HANDLER
 
+    _GLOBAL_RUN_CONFIG = None
+    _GLOBAL_TRAIN_STATE = None
+    _GLOBAL_RUNTIME_INITIALIZED = False
     _GLOBAL_ARGS = None
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
     _GLOBAL_TOKENIZER = None
@@ -199,6 +297,8 @@ def unset_global_variables():
 def set_args(args):
     global _GLOBAL_ARGS
     _GLOBAL_ARGS = args
+    global _GLOBAL_TRAIN_STATE
+    _GLOBAL_TRAIN_STATE = None
 
 
 def _build_tokenizer(args):
@@ -207,6 +307,58 @@ def _build_tokenizer(args):
     _ensure_var_is_not_initialized(_GLOBAL_TOKENIZER, 'tokenizer')
     _GLOBAL_TOKENIZER = build_tokenizer(args)
     return _GLOBAL_TOKENIZER
+
+
+def _resolve_runtime_batch_defaults(args):
+    """Resolve batch defaults before constructing the legacy microbatch calculator."""
+    from megatron.training.config import PretrainConfigContainer
+
+    cfg = get_run_config()
+    if not isinstance(cfg, PretrainConfigContainer):
+        return
+    batch_sizes = cfg._resolve_batch_sizes(get_batch_parallel_size(args))
+    (
+        cfg.train.global_batch_size,
+        cfg.validation.eval_global_batch_size,
+        cfg.validation.eval_micro_batch_size,
+    ) = batch_sizes
+    args.global_batch_size, args.eval_global_batch_size, args.eval_micro_batch_size = batch_sizes
+
+
+def _finalize_runtime_config(args):
+    """Finalize config policy and bridge derived inputs to the args-owned runtime.
+
+    Sample-based batch schedules require the microbatch calculator, so this runs after
+    its creation. Only run configuration is copied back; live progress, resume counters
+    and consumed samples remain owned by args/TrainState.
+    """
+    from dataclasses import fields
+
+    from megatron.training.config import PretrainConfigContainer
+    from megatron.training.config.container import ConfigContainerBase
+
+    cfg = _GLOBAL_RUN_CONFIG
+    if not isinstance(cfg, ConfigContainerBase):
+        return
+    cfg.finalize()
+    if isinstance(cfg, PretrainConfigContainer):
+        args.train_iters = cfg.train.train_iters
+        args.global_batch_size = cfg.train.global_batch_size
+        args.eval_global_batch_size = cfg.validation.eval_global_batch_size
+        args.eval_micro_batch_size = cfg.validation.eval_micro_batch_size
+        for field in fields(cfg.scheduler):
+            setattr(args, field.name, getattr(cfg.scheduler, field.name))
+    for field in fields(cfg.rng):
+        setattr(args, field.name, getattr(cfg.rng, field.name))
+
+
+def _bind_tokenizer_vocab_to_run_config(args):
+    """Resolve deferred config vocabulary after the retained tokenizer lifecycle."""
+    if _GLOBAL_RUN_CONFIG is None:
+        return
+    from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+
+    resolve_tokenizer_vocab_size(_GLOBAL_RUN_CONFIG, getattr(args, 'padded_vocab_size', None))
 
 
 def rebuild_tokenizer(args):

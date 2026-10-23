@@ -25,9 +25,8 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
     # _dim == v_head_dim). Apply it for any DSv4 MLA attention: experimental_attention_variant
     # == dsv4_hybrid, OR the layer pattern uses a DSv4 attention symbol (D/C/H/W). Idempotent.
     _pattern = getattr(args, "hybrid_layer_pattern", None) or ""
-    _uses_dsv4_attn = (
-        getattr(args, "experimental_attention_variant", None) == "dsv4_hybrid"
-        or any(sym in _pattern for sym in ("C", "H", "W"))
+    _uses_dsv4_attn = getattr(args, "experimental_attention_variant", None) == "dsv4_hybrid" or any(
+        sym in _pattern for sym in ("C", "H", "W")
     )
     if _uses_dsv4_attn:
         derived = config.v_head_dim - config.qk_pos_emb_head_dim

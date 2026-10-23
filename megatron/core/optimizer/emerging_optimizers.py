@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, Literal, Optional, get_args
 import torch
 from torch.optim.optimizer import ParamsT
 
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.utils import (
     get_emerging_optimizers_version,
     get_pg_rank,
@@ -502,9 +502,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         # TODO: Clean up code that determines if parameter is a MoE layer and which TP group to use
         is_expert = getattr(p, 'expert_tp', False)
         gtp_remat_group = (
-            (self.pg_collection.expt_gtp_remat if is_expert else self.pg_collection.gtp_remat)
-            if self.pg_collection
-            else None
+            resolve_gtp_remat_group(self.pg_collection, is_expert) if self.pg_collection else None
         )
 
         # Parameters with is_gtp_weight_remat=False are not sharded along the
@@ -688,10 +686,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         """
         if not getattr(p, 'is_gtp_weight_remat', False) or not self.pg_collection:
             return grad, None
-        gtp_remat_group = (
-            self.pg_collection.expt_gtp_remat
-            if getattr(p, 'expert_tp', False)
-            else self.pg_collection.gtp_remat
+        gtp_remat_group = resolve_gtp_remat_group(
+            self.pg_collection, getattr(p, 'expert_tp', False)
         )
         if gtp_remat_group is None or get_pg_size(gtp_remat_group) <= 1:
             return grad, None

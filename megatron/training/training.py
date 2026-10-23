@@ -54,6 +54,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV1,
     FullyShardedDataParallelV2,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
@@ -1328,10 +1329,10 @@ def num_floating_point_operations(
             + num_heads * (1 + num_householder)
         )
         conv_dim = d_inner * num_householder + num_groups * state_dim * (1 + num_householder)
-        non_core_flops = 2 * total_tokens * (
-            hidden_size * in_proj_dim
-            + conv_kernel_dim * conv_dim
-            + d_inner * hidden_size
+        non_core_flops = (
+            2
+            * total_tokens
+            * (hidden_size * in_proj_dim + conv_kernel_dim * conv_dim + d_inner * hidden_size)
         )
         # Best-case recurrent GDP core estimate. The FLA chunk kernel may do additional
         # score/solve/WY work, but this keeps the implementation-agnostic lower bound explicit.
@@ -1790,13 +1791,13 @@ def num_floating_point_operations(
                 linear_attention_pattern = [
                     # [1,1,...,1,0,1,1,...,1,0,...]
                     0 if ((i + 1) % args.linear_attention_freq == 0) else 1
-                    for i in range(num_layers)
+                    for i in range(args.num_layers)
                 ]
             elif isinstance(args.linear_attention_freq, list):
                 linear_attention_pattern = args.linear_attention_freq
-                assert len(linear_attention_pattern) == num_layers, (
+                assert len(linear_attention_pattern) == args.num_layers, (
                     f"Invalid length of linear_attention_pattern: {len(linear_attention_pattern)}, "
-                    f"expected {num_layers}, "
+                    f"expected {args.num_layers}, "
                     f"current linear attention pattern: {args.linear_attention_freq}"
                 )
             elif args.linear_attention_freq is None:
@@ -1811,7 +1812,9 @@ def num_floating_point_operations(
                     f"Invalid linear_attention_freq: {type(args.linear_attention_freq)},"
                     f" {args.linear_attention_freq}"
                 )
-            num_linear_attention_layers = sum(linear_attention_pattern)
+            num_linear_attention_layers = (
+                sum(linear_attention_pattern) + linear_attention_pattern[-1] * mtp_num_layers
+            )
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
             if args.experimental_attention_variant == "kda":
@@ -2044,6 +2047,7 @@ def num_floating_point_operations(
 
     def _uses_gated_delta_product_spec(args):
         """Return True when the selected hybrid stack spec swaps Mamba layers to GDP."""
+
         def _split_spec_part(part):
             return str(part).replace('[', ' ').replace(']', ' ').replace(',', ' ').split()
 
@@ -2394,6 +2398,10 @@ def pretrain(
 
     # Multimodal MiMo seeds each module's RNG in its builder; a plain collection seeds stock here.
     skip_random_seed = isinstance(pg_collection, MultiModuleProcessGroupCollection)
+
+    from megatron.training.global_vars import set_run_config
+
+    set_run_config(cfg_container)
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
@@ -2865,7 +2873,9 @@ def pretrain(
     if args.perform_rl_step:
         rl_utils.rl_inference_interface_shutdown()
 
-    if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+    if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(
+        args, 'gtp_expert_remat_nccl_ub', False
+    ):
         from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
 
         # Deregister the GTP symmetric-memory pools: windows left registered when the
@@ -3034,26 +3044,34 @@ def wrap_model_chunks_with_ddp(
                     expert_data_parallel_world_size=expert_data_parallel_world_size,
                 )
 
-    # Wrap each chunk.
+    is_mfsdp_v2 = (
+        DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2
+    ) and ddp_config.megatron_fsdp_version == 2
+    construction_context = (
+        fully_shard_context(use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True)
+        if is_mfsdp_v2
+        else nullcontext()
+    )
     wrapped = []
-    for chunk, layout, disable_bucketing in zip(
-        model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
-    ):
-        chunk_kwargs = {}
-        # TorchFSDP takes process_group, not pg_collection.
-        if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
-            chunk_kwargs["pg_collection"] = pg_collection
-        if layout is not None:
-            chunk_kwargs["full_param_layout"] = layout
-        wrapped.append(
-            DP(
-                config=config,
-                ddp_config=ddp_config,
-                module=chunk,
-                disable_bucketing=disable_bucketing,
-                **chunk_kwargs,
+    with construction_context:
+        for chunk, layout, disable_bucketing in zip(
+            model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
+        ):
+            chunk_kwargs = {}
+            # TorchFSDP takes process_group, not pg_collection.
+            if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
+                chunk_kwargs["pg_collection"] = pg_collection
+            if layout is not None:
+                chunk_kwargs["full_param_layout"] = layout
+            wrapped.append(
+                DP(
+                    config=config,
+                    ddp_config=ddp_config,
+                    module=chunk,
+                    disable_bucketing=disable_bucketing,
+                    **chunk_kwargs,
+                )
             )
-        )
     return wrapped
 
 
@@ -3249,14 +3267,20 @@ def get_model(
             for disable in per_chunk_disable_bucketing
         ]
 
+        current_stream = torch.cuda.current_stream()
         if config.cuda_graph_impl == "full_iteration":
             # DDP initialization must use the full-iteration capture stream so its retained
             # AccumulateGrad nodes do not reference a different, non-capturing stream.
             ddp_stream = get_shared_capture_stream()
+        elif config.cuda_graph_impl == "none":
+            # Eager initialization is serialized with the current stream. A one-shot side stream
+            # can leave cached blocks unavailable to later allocations on the current stream.
+            ddp_stream = current_stream
         else:
             # Preserve a dedicated initialization stream for all other implementations.
             ddp_stream = torch.cuda.Stream()
-        ddp_stream.wait_stream(torch.cuda.current_stream())
+        if ddp_stream is not current_stream:
+            ddp_stream.wait_stream(current_stream)
 
         with torch.cuda.stream(ddp_stream):
             model = wrap_model_chunks_with_ddp(
@@ -3271,8 +3295,9 @@ def get_model(
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
-        # Ensure initialization-stream work completes before touching params on the default stream.
-        torch.cuda.current_stream().wait_stream(ddp_stream)
+        # Ensure side-stream initialization completes before touching params on the current stream.
+        if ddp_stream is not current_stream:
+            current_stream.wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
         if args.data_parallel_random_init:
@@ -3287,7 +3312,9 @@ def get_optimizer_param_scheduler(optimizer):
     args = get_args()
 
     # Iteration-based training.
-    if args.train_iters:
+    # Finalization also derives train_iters for sample-based runs. Preserve the
+    # sample-based warmup/WSD interpretation when both horizon fields are present.
+    if args.train_iters and not args.train_samples:
         if args.lr_decay_iters is None:
             args.lr_decay_iters = args.train_iters
         lr_decay_steps = args.lr_decay_iters * args.global_batch_size
@@ -3913,17 +3940,22 @@ def train_step(
         # and subsequent param_data zero are baked into the graph and replay
         # unconditionally. We must populate param_data so the replayed AG gathers
         # correct weights, even when forward pre-hooks are disabled.
-        if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-            # Check if forward_pre_hook is enabled by checking if hooks are registered.
+        # Each optimizer owns its DDP overlap policy, which may differ across modules.
+        optimizer_instances = getattr(optimizer, 'chained_optimizers', [optimizer])
+        mxfp8_overlap_optimizers = [
+            optim_instance
+            for optim_instance in optimizer_instances
+            if isinstance(optim_instance, DistributedOptimizer)
+            and optim_instance.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+            and optim_instance.ddp_config.overlap_param_gather
+        ]
+        if mxfp8_overlap_optimizers:
             forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
             full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
             if forward_pre_hook_enabled or full_cg_captured:
-                for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
-                        # Only this DistOpt sibling consumes masters in the MXFP8 param-buffer
-                        # staging pass. The staging entry restores its own offloaded masters;
-                        # do not perturb the LayerWise/Muon master lifecycle here.
-                        optim_instance._copy_main_params_to_param_buffer()
+                for optim_instance in mxfp8_overlap_optimizers:
+                    # Restore only this DistOpt sibling's offloaded masters.
+                    optim_instance._copy_main_params_to_param_buffer()
 
         # In the delayed MXFP8 path, optimizer state was offloaded above while masters
         # remained resident for main-param staging. Start master D2H after that copy.
@@ -4189,7 +4221,7 @@ def training_log(
     # first iteration already is a complete window; retaining it would make
     # iteration 2 report the average of iterations 1 and 2 instead of the
     # current loss, which invalidates step-by-step alignment comparisons.
-    should_reset = not is_first_iteration or args.log_interval == 1
+    should_reset = not is_first_iteration or iteration % args.log_interval == 0
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
@@ -4598,7 +4630,12 @@ def training_log(
             # Report memory after optimizer state has been initialized.
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
-                report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
+                report_theoretical_memory(
+                    args,
+                    num_microbatches=num_microbatches,
+                    verbose=True,
+                    micro_batch_size=args.micro_batch_size,
+                )
             report_memory(
                 f'(after {iteration} iterations)',
                 process_group=pg_collection.dp if pg_collection is not None else None,
@@ -4758,6 +4795,7 @@ def save_checkpoint_and_time(
     tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
     pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
     dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
+    dp_gtp_remat_group = getattr(ckpt_pgc, "dp_gtp_remat", None) if ckpt_pgc is not None else None
     # Replica_id needs the gtp_remat-inclusive group (dp_cp_gtp_remat), not replicate dp_cp.
     dp_cp_group = getattr(ckpt_pgc, "dp_cp_gtp_remat", None) if ckpt_pgc is not None else None
     expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
@@ -4769,7 +4807,9 @@ def save_checkpoint_and_time(
 
     if should_report_memory:
         # Track memory before checkpoint save.
-        report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_group)
+        report_memory(
+            f"(before save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group
+        )
 
     # Save checkpoint.
     save_checkpoint(
@@ -4786,6 +4826,7 @@ def save_checkpoint_and_time(
         pp_group=pp_group,
         dp_cp_group=dp_cp_group,
         dp_group=dp_group,
+        dp_gtp_remat_group=dp_gtp_remat_group,
         expt_dp_group=expt_dp_group,
         rng_state_key_prefix=rng_state_key_prefix,
     )
@@ -4797,7 +4838,9 @@ def save_checkpoint_and_time(
 
     if should_report_memory:
         # Track memory after checkpoint save.
-        report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_group)
+        report_memory(
+            f"(after save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group
+        )
     num_checkpoints_memory_reported += 1
 
     if args.fp8:
@@ -5182,6 +5225,8 @@ def train(
 
     # Iterations.
     iteration = args.iteration
+    args._current_train_iteration = iteration
+    args._current_floating_point_operations = args.num_floating_point_operations_so_far
     # Make sure rerun_state_machine has the right iteration loaded from checkpoint.
     rerun_state_machine = get_rerun_state_machine()
     if rerun_state_machine.current_iteration != iteration:
@@ -5209,9 +5254,15 @@ def train(
     # Setup some training config params.
     config.grad_scale_func = optimizer.scale_loss if optimizer is not None else None
     config.timers = timers
-    if isinstance(
-        model[0], (FullyShardedDataParallelV1, FullyShardedDataParallelV2, DDP)
-    ) and args.overlap_grad_reduce:
+    # MFSDP v2 always reduces gradients during backward -- that is how FSDP shards them --
+    # and defers only the DP-outer axis to the last microbatch, so it needs no_sync_func to
+    # know which backward that is. Without it every backward finalizes that axis, the
+    # accumulation buffer is dropped, and only the last microbatch's gradient survives.
+    # DDP and MFSDP v1 instead reduce during backward only when overlap_grad_reduce is on,
+    # so without that flag there is nothing for no_sync to suppress.
+    if isinstance(model[0], FullyShardedDataParallelV2) or (
+        isinstance(model[0], (FullyShardedDataParallelV1, DDP)) and args.overlap_grad_reduce
+    ):
         assert config.no_sync_func is None, (
             'When overlap_grad_reduce is True, config.no_sync_func must be None; '
             'a custom no_sync_func is not supported when overlapping grad-reduce'
@@ -5455,6 +5506,10 @@ def train(
                     f"going from {num_microbatches} to {get_num_microbatches()}"
                 )
                 if args.save is not None:
+                    print_rank_0(
+                        "[StepBatchsizeNumMicroBatchesCalculator] Reached batch size "
+                        "transition, saving checkpoint before exiting."
+                    )
                     save_checkpoint_and_time(
                         iteration,
                         model,
@@ -5464,6 +5519,20 @@ def train(
                         checkpointing_context,
                         train_data_iterator=train_data_iterator,
                     )
+                    print_rank_0(
+                        "[StepBatchsizeNumMicroBatchesCalculator] Checkpoint saved, "
+                        "exiting so the run can be relaunched at the new batch size."
+                    )
+                    # Break here rather than leaving it to the `should_exit` check further
+                    # down the loop body, which sits after train_step and would run one more
+                    # iteration at the new microbatch count before stopping.
+                    should_exit = True
+                    break
+                print_rank_0(
+                    "[StepBatchsizeNumMicroBatchesCalculator] Reached batch size "
+                    "transition but --save is unset, so there is no checkpoint to "
+                    "relaunch from; continuing at the new batch size."
+                )
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
@@ -5489,6 +5558,7 @@ def train(
             if iteration == start_iteration:
                 start_iteration = iteration + 1
             iteration += 1
+            args._current_train_iteration = iteration
             batch_size = _dp_world_size() * args.micro_batch_size * get_num_microbatches()
             args.consumed_train_samples += batch_size
             args.skipped_train_samples += batch_size
@@ -5613,6 +5683,7 @@ def train(
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
+        args._current_train_iteration = iteration
 
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (
@@ -5624,9 +5695,7 @@ def train(
             for model_chunk in model:
                 if isinstance(
                     model_chunk, (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
-                ) and getattr(
-                    model_chunk.ddp_config, "fsdp_manual_registration", False
-                ):
+                ) and getattr(model_chunk.ddp_config, "fsdp_manual_registration", False):
                     param_and_grad_buffer = getattr(model_chunk, "param_and_grad_buffer", None)
                     if param_and_grad_buffer is not None:
                         param_and_grad_buffer.manual_buffer_registration()
@@ -5685,6 +5754,7 @@ def train(
             vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
         )
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
+        args._current_floating_point_operations = num_floating_point_operations_so_far
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
 
         # Logging.
@@ -5873,7 +5943,9 @@ def train(
         # ncclCommDeregister on handles created by ncclCommWindowRegister,
         # causing "NCCL WARN Deregister: Could not find handle" and a crash.
         torch.distributed.barrier()
-        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(
+            args, 'gtp_expert_remat_nccl_ub', False
+        ):
             from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
 
             # Deregister the GTP symmetric-memory pools: windows left registered when the
@@ -5945,6 +6017,7 @@ def evaluate(
     eval_pgc = get_attr_wrapped_model(model[0], "pg_collection")
     if eval_pgc is None:
         eval_pgc = ProcessGroupCollection.use_mpu_process_groups()
+    eval_dp_cp_group = getattr(eval_pgc, "dp_cp_gtp_remat", None) or eval_pgc.dp_cp
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -6027,19 +6100,10 @@ def evaluate(
                     val = [x[key].view(-1) for x in loss_dicts]
 
                     if val[0].numel() == 2:
-                        if args.sft:
-                            # normalize over micro batch instead of global
-                            val = torch.vstack(val)
-                            val = val[:, 0] / val[:, 1].clamp(min=1)
-                            val = val.mean()
-                            torch.distributed.all_reduce(val, group=eval_pgc.dp_cp)
-                            val /= torch.distributed.get_world_size(group=eval_pgc.dp_cp)
-                            total_loss_dict[key][0] += val
-                            total_loss_dict[key][1] += 1
-                        else:
-                            val = torch.vstack(val).sum(dim=0)
-                            torch.distributed.all_reduce(val, group=eval_pgc.dp_cp)
-                            total_loss_dict[key] += val
+                        # Weight by valid tokens across microbatches and every distinct-data rank.
+                        val = torch.vstack(val).sum(dim=0)
+                        torch.distributed.all_reduce(val, group=eval_dp_cp_group)
+                        total_loss_dict[key] += val
                     elif val[0].numel() == 1:
                         val = torch.cat(val).sum()
                         total_loss_dict[key][0] += val
@@ -6085,7 +6149,7 @@ def evaluate(
 
     for key in total_loss_dict:
         numerator, denominator = total_loss_dict[key]
-        total_loss_dict[key] = numerator / denominator
+        total_loss_dict[key] = numerator / denominator.clamp(min=1)
 
     timers('evaluate').stop()
     timers.log(['evaluate'])

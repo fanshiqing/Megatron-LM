@@ -1469,6 +1469,7 @@ def _loader_args(*, use_varlen, sbhd, scheduler, mbs, dynamic_cp=False, gbs=None
         global_batch_size=mbs if gbs is None else gbs,
         full_validation=False,
         dynamic_context_parallel=dynamic_cp,
+        hybrid_context_parallel=False,
         num_workers=num_workers,
         use_varlen_dataset=use_varlen,
         varlen_sbhd_validation=sbhd,
@@ -1476,7 +1477,7 @@ def _loader_args(*, use_varlen, sbhd, scheduler, mbs, dynamic_cp=False, gbs=None
     )
 
 
-def test_sbhd_validation_dataloader_uses_default_collate():
+def test_sbhd_validation_dataloader_uses_default_collate(run_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
@@ -1486,6 +1487,8 @@ def test_sbhd_validation_dataloader_uses_default_collate():
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         seq_len, mbs = 16, 2
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = mbs
         # One global batch needs micro_batch_size * data_parallel_size samples;
         # size the dataset off the runtime DP world size so this passes under
         # any --nproc-per-node (the CI default is 8 ranks -> dp=8).
@@ -1508,7 +1511,7 @@ def test_sbhd_validation_dataloader_uses_default_collate():
         Utils.destroy_model_parallel()
 
 
-def test_thd_dataloader_uses_identity_collate():
+def test_thd_dataloader_uses_identity_collate(run_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
@@ -1518,6 +1521,8 @@ def test_thd_dataloader_uses_identity_collate():
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         mbs = 2
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = mbs
         dp = parallel_state.get_data_parallel_world_size()
         n = mbs * dp * 4
         cfg = _make_config(tok, seq_length=64, sbhd=False)
@@ -1537,7 +1542,7 @@ def test_thd_dataloader_uses_identity_collate():
         Utils.destroy_model_parallel()
 
 
-def test_dcp_dataloader_yields_microbatches_for_scheduler():
+def test_dcp_dataloader_yields_microbatches_for_scheduler(run_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
@@ -1550,6 +1555,12 @@ def test_dcp_dataloader_yields_microbatches_for_scheduler():
         num_microbatches = 3
         dp = parallel_state.get_data_parallel_world_size()
         gbs = mbs * dp * num_microbatches
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = gbs
+        run_config.validation.eval_micro_batch_size = mbs
+        run_config.validation.eval_global_batch_size = gbs
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = gbs
         n = gbs * 2
         cfg = _make_config(tok, seq_length=64, dp=dp, cp=1, dynamic_cp=True)
         variable = ["a", "abcdef", "xy", "qwerty"]
@@ -1583,7 +1594,7 @@ def test_dcp_dataloader_yields_microbatches_for_scheduler():
     [("dp_balanced", 5), ("default_dynamic_cp", 5), (None, 2)],
 )
 def test_packing_scheduler_dataloader_prefetches_next_global_batch(
-    scheduler, expected_prefetch_factor
+    scheduler, expected_prefetch_factor, run_config
 ):
     from megatron.core import parallel_state
     from megatron.core.datasets.utils import Split
@@ -1597,6 +1608,10 @@ def test_packing_scheduler_dataloader_prefetches_next_global_batch(
         mbs, num_microbatches, num_workers = 2, 9, 2
         dp = parallel_state.get_data_parallel_world_size()
         gbs = mbs * dp * num_microbatches
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = gbs
+        run_config.validation.eval_micro_batch_size = mbs
+        run_config.validation.eval_global_batch_size = gbs
         dynamic_cp = scheduler == "default_dynamic_cp"
         cfg = _make_config(tok, seq_length=64, dp=dp, dynamic_cp=dynamic_cp)
         ds = _build_varlen_for_loader(["abc"] * gbs * 2, cfg, num_samples=gbs * 2)

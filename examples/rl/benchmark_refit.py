@@ -6,19 +6,22 @@ Benchmark script for model refit performance.
 Measures the time to transfer model weights between different parallelism configurations.
 Supports both collocated (models share GPUs) and non-collocated (separate GPU sets) modes.
 """
+
 import time
 
 import torch
 
-from megatron.core.resharding.refit import swap_model_weights
-from megatron.training import get_args, get_model as get_training_model, print_rank_0
-from megatron.training.initialize import initialize_megatron
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.rl.parallel_utils import build_inference_pg_collection
 from gpt_builders import gpt_builder
-from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
-from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
 from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
+from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
+from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
+from megatron.core.resharding.refit import swap_model_weights
+from megatron.rl.parallel_utils import build_inference_pg_collection
+from megatron.training import get_args
+from megatron.training import get_model as get_training_model
+from megatron.training import print_rank_0
+from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.initialize import initialize_megatron
 
 
 def add_benchmark_args(parser):
@@ -30,26 +33,27 @@ def add_benchmark_args(parser):
         type=str,
         required=True,
         choices=['collocated', 'non-collocated'],
-        help='Collocated: both models share GPUs. Non-collocated: separate GPU sets.'
+        help='Collocated: both models share GPUs. Non-collocated: separate GPU sets.',
     )
     group.add_argument(
         '--num-benchmark-warmup',
         type=int,
         default=2,
-        help='Number of warmup iterations (first builds refit plan).'
+        help='Number of warmup iterations (first builds refit plan).',
     )
     group.add_argument(
         '--num-benchmark-iterations',
         type=int,
         default=10,
-        help='Number of timed benchmark iterations.'
+        help='Number of timed benchmark iterations.',
     )
 
     return parser
 
 
-def model_provider(pre_process=True, post_process=True, parallel_output=False,
-                   pg_collection=None, config=None):
+def model_provider(
+    pre_process=True, post_process=True, parallel_output=False, pg_collection=None, config=None
+):
     """Build the model."""
     args = get_args()
     if config is None:
@@ -82,9 +86,15 @@ def print_config_summary(args, src_config, dst_config, world_size, mode):
     print_rank_0(f"REFIT BENCHMARK - {mode.upper()} MODE")
     print_rank_0(f"{'='*80}")
     print_rank_0(f"World size: {world_size}")
-    print_rank_0(f"Source:      TP={src_config['tp']}, PP={src_config['pp']}, EP={src_config['ep']}, DP={src_config['dp']}")
-    print_rank_0(f"Destination: TP={dst_config['tp']}, PP={dst_config['pp']}, EP={dst_config['ep']}, DP={dst_config['dp']}")
-    print_rank_0(f"Model: {args.num_layers}L, {args.hidden_size}H, {args.num_attention_heads} heads, vocab={args.vocab_size}")
+    print_rank_0(
+        f"Source:      TP={src_config['tp']}, PP={src_config['pp']}, EP={src_config['ep']}, DP={src_config['dp']}"
+    )
+    print_rank_0(
+        f"Destination: TP={dst_config['tp']}, PP={dst_config['pp']}, EP={dst_config['ep']}, DP={dst_config['dp']}"
+    )
+    print_rank_0(
+        f"Model: {args.num_layers}L, {args.hidden_size}H, {args.num_attention_heads} heads, vocab={args.vocab_size}"
+    )
     if args.num_experts:
         print_rank_0(f"MoE: {args.num_experts} experts, top-{args.moe_router_topk}")
     print_rank_0(f"Backend: {args.refit_method}")
@@ -171,7 +181,7 @@ def benchmark_collocated():
         lambda pre_process, post_process, **kwargs: model_provider(
             pre_process=pre_process, post_process=post_process, parallel_output=False
         ),
-        wrap_with_ddp=False
+        wrap_with_ddp=False,
     )
     src_model[0] = src_model[0].cuda()
 
@@ -195,10 +205,12 @@ def benchmark_collocated():
 
     dst_model = get_training_model(
         lambda pre_process, post_process, **kwargs: model_provider(
-            pre_process=pre_process, post_process=post_process,
-            pg_collection=dst_pg_collection, config=dst_config
+            pre_process=pre_process,
+            post_process=post_process,
+            pg_collection=dst_pg_collection,
+            config=dst_config,
         ),
-        wrap_with_ddp=False
+        wrap_with_ddp=False,
     )
     dst_model[0] = dst_model[0].cuda()
 
@@ -210,8 +222,13 @@ def benchmark_collocated():
     print_rank_0("Service created.\n")
 
     # Run benchmark
-    timings = run_benchmark(src_model, dst_model, refit_service,
-                           args.num_benchmark_warmup, args.num_benchmark_iterations)
+    timings = run_benchmark(
+        src_model,
+        dst_model,
+        refit_service,
+        args.num_benchmark_warmup,
+        args.num_benchmark_iterations,
+    )
 
     # Print results
     print_results(timings)
@@ -274,7 +291,7 @@ def benchmark_non_collocated():
             lambda pre_process, post_process, **kwargs: model_provider(
                 pre_process=pre_process, post_process=post_process, parallel_output=False
             ),
-            wrap_with_ddp=False
+            wrap_with_ddp=False,
         )
         src_model[0] = src_model[0].cuda()
         dst_model = None
@@ -286,14 +303,18 @@ def benchmark_non_collocated():
             dst_config.expert_model_parallel_size = dst_ep
         dst_config.tensor_model_parallel_size = dst_tp
         if args.rl_inference_expert_tensor_model_parallel_size:
-            dst_config.expert_tensor_parallel_size = args.rl_inference_expert_tensor_model_parallel_size
+            dst_config.expert_tensor_parallel_size = (
+                args.rl_inference_expert_tensor_model_parallel_size
+            )
 
         dst_model = get_training_model(
             lambda pre_process, post_process, **kwargs: model_provider(
-                pre_process=pre_process, post_process=post_process,
-                pg_collection=dst_pg_collection, config=dst_config
+                pre_process=pre_process,
+                post_process=post_process,
+                pg_collection=dst_pg_collection,
+                config=dst_config,
             ),
-            wrap_with_ddp=False
+            wrap_with_ddp=False,
         )
         dst_model[0] = dst_model[0].cuda()
         src_model = None
@@ -306,8 +327,13 @@ def benchmark_non_collocated():
     print_rank_0("Service created.\n")
 
     # Run benchmark
-    timings = run_benchmark(src_model, dst_model, refit_service,
-                           args.num_benchmark_warmup, args.num_benchmark_iterations)
+    timings = run_benchmark(
+        src_model,
+        dst_model,
+        refit_service,
+        args.num_benchmark_warmup,
+        args.num_benchmark_iterations,
+    )
 
     # Print results
     print_results(timings)

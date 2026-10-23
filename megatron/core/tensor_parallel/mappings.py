@@ -3,7 +3,11 @@
 import torch
 
 from megatron.core.parallel_state import get_global_memory_buffer
-from megatron.core.utils import get_tensor_model_parallel_group_if_none, is_torch_min_version
+from megatron.core.utils import (
+    get_pg_size,
+    get_tensor_model_parallel_group_if_none,
+    is_torch_min_version,
+)
 
 from .utils import split_tensor_along_last_dim
 
@@ -555,6 +559,8 @@ def scatter_to_tensor_model_parallel_region(input_, group=None):
 def gather_from_tensor_model_parallel_region(input_, group=None):
     """Wrapper for autograd function: forward: AG, backward: split <last dim>"""
     group = get_tensor_model_parallel_group_if_none(group)
+    if get_pg_size(group) == 1:
+        return input_
     return _GatherFromModelParallelRegion.apply(input_, group)
 
 
@@ -583,6 +589,7 @@ def async_gather_from_sequence_parallel_region(
 ):
     """Launch an equal-split AG and return a handle whose ``wait`` yields its tensor.
 
+    ``group=None`` uses the tensor-parallel group; explicit groups are preserved.
     The caller must wait before the gathered tensor's first use. The returned
     tensor retains the same autograd contract as
     :func:`gather_from_sequence_parallel_region`: its backward either
@@ -602,6 +609,7 @@ def async_gather_from_sequence_parallel_region(
 def async_reduce_scatter_along_first_dim(input_, group=None):
     """Launch an equal-split first-dimension reduce-scatter and return a handle.
 
+    ``group=None`` uses the tensor-parallel group; explicit groups are preserved.
     This helper is intended for custom backward implementations that have
     independent work to execute before the reduced local gradient is consumed.
     The caller must invoke ``wait`` before using the returned tensor.

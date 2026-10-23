@@ -41,7 +41,7 @@ int requested_handle_types(CUdevice device, bool* fabric_added) {
     return types;
 }
 
-void* gtp_vmm_alloc_plug(size_t size, int device, void* stream) {
+void* vmm_alloc_plug(size_t size, int device, void* stream) {
     (void)stream;
     // Make the allocation's device current for the driver calls.
     c10::cuda::CUDAGuard device_guard(static_cast<c10::DeviceIndex>(device));
@@ -103,7 +103,7 @@ void* gtp_vmm_alloc_plug(size_t size, int device, void* stream) {
     return (void*)address;
 }
 
-void gtp_vmm_free_plug(void* ptr, size_t size, int device, void* stream) {
+void vmm_free_plug(void* ptr, size_t size, int device, void* stream) {
     (void)size;
     (void)stream;
     c10::cuda::CUDAGuard device_guard(static_cast<c10::DeviceIndex>(device));
@@ -128,7 +128,7 @@ void maybe_init() {
     if (!vmm_allocator) {
         vmm_allocator =
             std::make_shared<torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator>(
-                gtp_vmm_alloc_plug, gtp_vmm_free_plug);
+                vmm_alloc_plug, vmm_free_plug);
     }
 }
 

@@ -3,6 +3,7 @@
 import logging
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -131,6 +132,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         post_process (bool, optional): Include an output layer (used with pipeline parallelism).
             Defaults to True.
         fp16_lm_cross_entropy (bool, optional): Defaults to False.
+        logit_dtype (torch.dtype, optional): Output-layer GEMM dtype; None keeps the input dtype.
         parallel_output (bool, optional): Do not gather the outputs, keep them split across tensor
             parallel ranks. Defaults to True.
         share_embeddings_and_output_weights (bool, optional): When True, input embeddings and
@@ -173,6 +175,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         seq_len_interpolation_factor: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        logit_dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 
@@ -194,6 +197,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
+        self.logit_dtype = logit_dtype
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
@@ -409,6 +413,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,
                 tp_group=self.pg_collection.tp,
+                output_dtype=self.logit_dtype,
                 pg_collection=self.pg_collection,
             )
 

@@ -88,9 +88,23 @@ def test_qb_cli_exposes_global_batch_scope_and_histogram_bins():
     assert args.moe_router_qb_num_bins == 257
 
 
-def test_qb_dev_rejects_micro_batch_scope():
-    with pytest.raises(ValueError, match="dev supports only"):
-        _config(moe_router_quantile_balancing_estimation_scope="micro_batch")
+def test_qb_main_accepts_micro_batch_scope():
+    config = _config(moe_router_quantile_balancing_estimation_scope="micro_batch")
+    assert config.moe_router_quantile_balancing_estimation_scope == "micro_batch"
+
+
+def test_qb_main_defaults_to_micro_batch_scope():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_router_topk=1,
+        moe_router_score_function="sigmoid",
+        moe_router_load_balancing_type="quantile_balancing",
+        moe_aux_loss_coeff=0.0,
+    )
+    assert config.moe_router_quantile_balancing_estimation_scope == "micro_batch"
 
 
 def test_qb_rejects_nonzero_aux_loss():
@@ -98,9 +112,26 @@ def test_qb_rejects_nonzero_aux_loss():
         _config(moe_aux_loss_coeff=0.01)
 
 
-def test_qb_rejects_pre_softmax_routing():
-    with pytest.raises(ValueError, match="does not use pre-softmax"):
-        _config(moe_router_pre_softmax=True)
+@pytest.mark.parametrize("scope", ["micro_batch", "global_batch"])
+@pytest.mark.parametrize("num_experts, topk", [(8, 8), (1, 1), (8, 9), (8, 0), (8, -1)])
+def test_qb_rejects_invalid_topk(scope, num_experts, topk):
+    with pytest.raises(ValueError, match="0 < moe_router_topk < num_moe_experts"):
+        _config(
+            moe_router_quantile_balancing_estimation_scope=scope,
+            num_moe_experts=num_experts,
+            moe_router_topk=topk,
+        )
+
+
+@pytest.mark.parametrize("scope", ["micro_batch", "global_batch"])
+@pytest.mark.parametrize("num_experts, topk", [(2, 1), (8, 1), (8, 7)])
+def test_qb_accepts_valid_topk(scope, num_experts, topk):
+    config = _config(
+        moe_router_quantile_balancing_estimation_scope=scope,
+        num_moe_experts=num_experts,
+        moe_router_topk=topk,
+    )
+    assert config.moe_router_topk == topk
 
 
 def test_qb_treats_negative_capacity_as_disabled():
@@ -126,7 +157,6 @@ def test_qb_rejects_active_expert_capacity():
         ({"moe_router_num_groups": 2, "moe_router_group_topk": 1}, "does not support group"),
         ({"moe_enable_routing_replay": True}, "does not support routing replay"),
         ({"moe_expert_rank_capacity_factor": 1.0}, "expert-rank capacity requires"),
-        ({"moe_router_topk": 4}, "requires 0 < moe_router_topk"),
         ({"moe_router_qb_num_bins": 1}, "must be greater than one"),
     ],
 )
@@ -302,7 +332,7 @@ def test_qb_finalize_updates_once_and_reset_preserves_buffers():
     histogram_ptr = router.qb_histogram.data_ptr()
     bounds_ptr = router.qb_bin_bounds.data_ptr()
 
-    _update_router_expert_bias_with_quantile([model], config)
+    _update_router_expert_bias_with_quantile([model], config, reduction_groups=())
 
     torch.testing.assert_close(router.expert_bias, torch.tensor([0.25, -0.25]))
     reset_model_temporary_tensors(config, [model])
@@ -315,7 +345,7 @@ def test_qb_finalize_without_active_router_is_a_noop():
     model = torch.nn.Module()
     config = SimpleNamespace(moe_router_topk=1)
 
-    _update_router_expert_bias_with_quantile([model], config)
+    _update_router_expert_bias_with_quantile([model], config, reduction_groups=())
 
 
 def test_qb_router_maintains_float32_bias_and_bounds():
@@ -332,18 +362,30 @@ def test_qb_router_maintains_float32_bias_and_bounds():
     assert router.qb_bin_bounds.dtype == torch.float32
 
 
-def test_qb_paged_stash_retry_discards_failed_attempt_histogram():
+@pytest.mark.parametrize("scope", ["global_batch", "micro_batch"])
+def test_qb_paged_stash_retry_discards_failed_attempt_histogram(scope):
     from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 
-    histogram = torch.ones(3, 7, dtype=torch.int32)
-    histogram_ptr = histogram.data_ptr()
+    persistent_bias = torch.tensor([0.5, -0.5, 0.0])
+    if scope == "global_batch":
+        observations = [torch.ones(3, 7, dtype=torch.int32)]
+        router = SimpleNamespace(qb_histogram=observations[0], expert_bias=persistent_bias)
+    else:
+        observations = [torch.ones(3), torch.tensor(2, dtype=torch.int64)]
+        router = SimpleNamespace(
+            qb_beta_accum=observations[0], qb_beta_count=observations[1], qb_beta=persistent_bias
+        )
+    pointers = [buffer.data_ptr() for buffer in observations]
+    bias_before = persistent_bias.clone()
     runner = PagedStashRunner.__new__(PagedStashRunner)
-    runner.moe_layers = [SimpleNamespace(router=SimpleNamespace(qb_histogram=histogram))]
+    runner.moe_layers = [SimpleNamespace(router=router)]
 
     runner._reset_qb_histograms()
 
-    assert torch.count_nonzero(histogram) == 0
-    assert histogram.data_ptr() == histogram_ptr
+    for buffer, pointer in zip(observations, pointers):
+        assert torch.count_nonzero(buffer) == 0
+        assert buffer.data_ptr() == pointer
+    torch.testing.assert_close(persistent_bias, bias_before)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -415,7 +457,7 @@ def test_qb_mcore_router_accumulates_microbatches_and_finalizes(fused, monkeypat
         marked_bounds.append,
     )
     _update_router_expert_bias_with_quantile(
-        [layer], config, tp_dp_cp_group=torch.distributed.group.WORLD
+        [layer], config, reduction_groups=(torch.distributed.group.WORLD,)
     )
 
     assert len(marked_bounds) == 1

@@ -260,9 +260,9 @@ def get_tokens_per_expert_and_token_count(
     """
     local_tokens_per_expert = routing_map.sum(dim=0)
     if reduce_groups is None:
-        reduce_groups = (reduce_group,)
+        reduce_groups = reduce_group if isinstance(reduce_group, tuple) else (reduce_group,)
 
-    global_tokens_per_expert = local_tokens_per_expert
+    global_tokens_per_expert = local_tokens_per_expert.clone()
     reduce_world_size = 1
     for group in reduce_groups:
         global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
@@ -735,8 +735,10 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
     Returns:
         torch.Tensor: The padded routing map of shape [num_tokens, num_experts].
     """
-    # Transpose to [num_experts, num_tokens] for easier row-wise operations
-    routing_map = routing_map.transpose(0, 1)  # [num_experts, num_tokens]
+    # Work on a copy because fused router autograd saves the returned routing
+    # map for backward. Padding a transposed view in place would increment the
+    # saved tensor's version counter and make backward fail.
+    routing_map = routing_map.clone().transpose(0, 1)  # [num_experts, num_tokens]
 
     # Calculate how many tokens need to be padded for each expert
     num_ones = routing_map.sum(dim=1)
@@ -766,6 +768,7 @@ def topk_routing_with_score_function(
     fused: bool = False,
     router_replay: Optional['RouterReplay'] = None,
     dense_output: bool = False,
+    precomputed_indices: Optional[torch.Tensor] = None,
     qb_histogram: Optional[torch.Tensor] = None,
     qb_bin_bounds: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
@@ -793,6 +796,10 @@ def topk_routing_with_score_function(
                                               Defaults to None.
         dense_output (bool, optional): If True, return dense tensors [num_tokens, topk] instead of
                                        sparse tensors [num_tokens, num_experts]. Defaults to False.
+        precomputed_indices (torch.Tensor, optional): Top-k indices [num_tokens, topk]
+                                       selected by the caller. When given, the score function's
+                                       own top-k is bypassed and probs are computed at these
+                                       indices (e.g. for quantile balancing). Defaults to None.
         qb_histogram (torch.Tensor, optional): Caller-owned int32 K3 Quantile Balancing histogram
                                                with shape [num_experts, num_bins].
         qb_bin_bounds (torch.Tensor, optional): FP32 CUDA tensor containing the lower and upper
@@ -834,6 +841,8 @@ def topk_routing_with_score_function(
             raise ValueError("Quantile Balancing does not support group-limited routing.")
         if router_replay is not None:
             raise ValueError("Quantile Balancing does not support router replay.")
+        if precomputed_indices is not None:
+            raise ValueError("Histogram Quantile Balancing computes its own top-(k+1).")
         if qb_histogram.dim() != 2 or qb_histogram.shape[0] != num_experts:
             raise ValueError(
                 "qb_histogram must have shape [num_experts, num_bins], got "
@@ -843,6 +852,9 @@ def topk_routing_with_score_function(
             raise ValueError("qb_histogram must have dtype torch.int32.")
         if qb_bin_bounds.shape != (2,) or qb_bin_bounds.dtype != torch.float32:
             raise ValueError("qb_bin_bounds must be an FP32 tensor with shape [2].")
+    assert not (
+        fused and precomputed_indices is not None
+    ), "precomputed_indices is not supported with the fused top-k score function."
     if fused:
         if not HAVE_TE or fused_topk_with_score_function is None:
             raise ValueError(
@@ -933,16 +945,27 @@ def topk_routing_with_score_function(
     if score_function == "softmax":
         if use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
-            probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+            if precomputed_indices is not None:
+                top_indices = precomputed_indices
+                probs = torch.gather(scores, dim=1, index=top_indices)
+            else:
+                probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         else:
-            scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
+            if precomputed_indices is not None:
+                top_indices = precomputed_indices
+                scores = torch.gather(logits, dim=1, index=top_indices)
+            else:
+                scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
     elif score_function in ("sigmoid", "sqrtsoftplus"):
         if score_function == "sigmoid":
             scores = torch.sigmoid(logits.float())
         else:
             scores = torch.nn.functional.softplus(logits.float()).sqrt()
-        if expert_bias is not None:
+        if precomputed_indices is not None:
+            top_indices = precomputed_indices
+            scores = torch.gather(scores, dim=1, index=top_indices)
+        elif expert_bias is not None:
             scores_for_routing = scores + expert_bias.float()
             if use_quantile_balancing:
                 topk_result = torch.topk(scores_for_routing, topk + 1, dim=1, sorted=True)
@@ -1913,3 +1936,66 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
         return wrapped_func
 
     return decorator
+
+
+def qb_dual_update(
+    scores: torch.Tensor, k: int, beta: torch.Tensor, update_beta: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dual coordinate-descent quantile-balancing routing assignment.
+
+    Picks the top-k experts per token from ``scores - beta``. When ``update_beta`` is
+    True, also returns the raw column quantile of ``scores`` that drives each expert
+    toward ``m * k / n`` tokens.
+
+    Args:
+        scores (torch.Tensor): Scores of shape ``[m, n]`` (tokens, experts).
+        k (int): Experts to select per token.
+        beta (torch.Tensor): Current per-expert bias of shape ``[n]``.
+        update_beta (bool): If False, return ``beta`` unchanged (eval/inference).
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: indices of shape ``[m, k]`` and either
+        ``beta`` (when ``update_beta`` is False) or the column quantile ``[n]``.
+    """
+    num_tokens, num_experts = scores.shape
+
+    topk_result = (scores - beta).topk(k + 1, dim=1)
+    indices = topk_result.indices[:, :-1]
+
+    if not update_beta:
+        return indices, beta
+
+    assert (num_tokens * k) % num_experts == 0, (
+        "Quantile balancing requires the number of routed assignments "
+        f"({num_tokens} tokens * top-{k}) to be divisible by "
+        f"{num_experts} experts."
+    )
+    col_target = num_tokens * k // num_experts
+    alpha = topk_result.values[:, -1:]
+    beta_local = (scores - alpha).topk(col_target + 1, dim=0).values[-1].contiguous()
+    return indices, beta_local
+
+
+def compute_normalized_router_scores(logits: torch.Tensor, score_function: str) -> torch.Tensor:
+    """Compute the normalized score distribution over all experts.
+
+    Args:
+        logits: Router logits with experts in the final dimension.
+        score_function: Score function to use. Must be `softmax`, `sigmoid`, or
+            `sqrtsoftplus`.
+
+    Returns:
+        Float32 normalized router scores with the same shape as `logits`.
+
+    Raises:
+        ValueError: If `score_function` is unsupported.
+    """
+    if score_function == "softmax":
+        return torch.softmax(logits, dim=-1, dtype=torch.float32)
+    if score_function == "sigmoid":
+        scores = torch.sigmoid(logits.float())
+    elif score_function == "sqrtsoftplus":
+        scores = torch.nn.functional.softplus(logits.float()).sqrt()
+    else:
+        raise ValueError(f"Invalid score_function: {score_function}")
+    return scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)

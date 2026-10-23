@@ -105,6 +105,19 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
             param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
 
 
+def _all_gather_param_group_metadata(param_group, pg_collection):
+    """Gather optimizer-group metadata within the group that owns the parameters."""
+    process_group = (
+        pg_collection.expt_dp
+        if param_group.get('is_expert_parallel', False)
+        else pg_collection.dp_cp
+    )
+    assert process_group is not None, "LayerWise optimizer checkpoint group is not initialized"
+    all_rank_groups = [None for _ in range(get_pg_size(process_group))]
+    torch.distributed.all_gather_object(all_rank_groups, param_group, group=process_group)
+    return all_rank_groups
+
+
 def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int, int]]:
     """Map each (E)GTP_remat-REPLICATED param to ``(gtp_rank, gtp_remat_size)`` for folding.
 
@@ -618,6 +631,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         self.pg_collection = pg_collection
         self.decouple_ddp_layout = not config.use_layer_wise_param_layout
+        self.grad_stats_parallel_group = getattr(pg_collection, 'intra_dist_opt', None)
+
+        # DDP owns the parameter-gather schedule. Heterogeneous modules can carry different
+        # overlap policies, so use the wrapped chunks' DDP config just like DistributedOptimizer.
+        self.ddp_config = None
+        if model_chunks:
+            self.ddp_config = model_chunks[0].ddp_config
+            if any(model_chunk.ddp_config != self.ddp_config for model_chunk in model_chunks[1:]):
+                raise ValueError("LayerWise optimizer model chunks must share one DDP config")
 
         # The data-parallel groups this optimizer shards parameters over. Cached here so the
         # sharding, all-gather and broadcast paths read one attribute instead of reaching back
@@ -787,7 +809,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             # tensor per fp8 param) for locally owned params. Without this sweep every DP rank
             # retains ~(dp-1)/dp of the LayerWise matrix params' bf16 CPU copies for the whole
             # run. The per-rank ownership lists cover all gathered params (owned entries were
-            # already cleared during master creation; TE's clear is a no-op then). Scoped to
+            # already cleared during master creation and are skipped here). Scoped to
             # LayerWise-managed params only: sibling DistOpt params must keep their init val
             # until their own optimizer's master creation consumes it.
             for params_list in (self.dp_cp_params_list, self.expt_dp_params_list):
@@ -795,15 +817,24 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     continue
                 for per_rank_params in params_list:
                     for p in per_rank_params:
-                        if hasattr(p, 'clear_high_precision_init_val'):
-                            p.clear_high_precision_init_val()
+                        getter = getattr(p, 'get_high_precision_init_val', None)
+                        clearer = getattr(p, 'clear_high_precision_init_val', None)
+                        if getter is not None and clearer is not None and getter() is not None:
+                            clearer()
 
         self.tp_group = getattr(self.pg_collection, 'tp', None)
         self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
+        # The module's own GTP axes: a MIMO module's grid carries these, and MPU has no
+        # globals to fall back on there (see param_is_not_gtp_duplicate).
+        self.gtp_group = getattr(self.pg_collection, 'gtp_remat', None)
+        self.expert_gtp_group = getattr(self.pg_collection, 'expt_gtp_remat', None)
         for optimizer in optimizers:
-            # Child optimizers perform TP duplicate filtering when collecting gradients.
+            # Child optimizers perform duplicate filtering and gradient-stat reductions.
+            optimizer.grad_stats_parallel_group = self.grad_stats_parallel_group
             optimizer.tp_group = self.tp_group
             optimizer.expert_tp_group = self.expert_tp_group
+            optimizer.gtp_group = self.gtp_group
+            optimizer.expert_gtp_group = self.expert_gtp_group
 
         super().__init__(optimizers)
 
@@ -1040,9 +1071,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             return None
         identity: Dict[torch.nn.Parameter, tuple] = {}
         for chunk_idx, chunk in enumerate(model_chunks):
-            buffers = list(getattr(chunk, 'buffers', [])) + list(
-                getattr(chunk, 'expert_parallel_buffers', [])
-            )
+            buffers = []
+            for name in ('buffers', 'expert_parallel_buffers'):
+                chunk_buffers = getattr(chunk, name, ())
+                # Unwrapped nn.Module exposes buffers() rather than DDP's buffer list.
+                # It has no parameter-layout metadata, so retain the legacy fallback.
+                if not callable(chunk_buffers):
+                    buffers.extend(chunk_buffers)
             for buffer_idx, buffer in enumerate(buffers):
                 param_index_map = getattr(buffer, 'param_index_map', None)
                 if param_index_map is None:
@@ -1331,21 +1366,20 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
     @torch.no_grad()
     def get_grad_norm(self):
-        # similar to dist opt, always aggregate globally
+        # Aggregate across the module-local optimizer domain.
         grads_for_norm = []
         for optimizer in self.chained_optimizers:
             grads_for_norm += optimizer.get_grads_for_grad_norm()
-        grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
+        grad_norm = get_grad_norm_fp32(
+            grads_for_norm, grad_stats_parallel_group=self.grad_stats_parallel_group
+        )
         return grad_norm
 
     def has_grad_norm_group(self, grad_norm_group: str) -> bool:
-        """Whether any global rank owns params for a registered grad-norm group.
+        """Whether any rank in this optimizer's module owns a registered grad-norm group.
 
-        Overrides ChainedOptimizer to use a single global all-reduce (group=None),
-        matching the scope of get_grad_norm and _get_grad_norm_for_group which also
-        reduce globally. All LayerWise grad-stats reductions are global (identical to
-        DistributedOptimizer's pattern), so the existence check must be too — using
-        a per-sub-optimizer group here would create a collective mismatch.
+        The existence check uses the same module-local group as the corresponding
+        gradient-norm reductions so heterogeneous modules cannot mismatch collectives.
         """
         _validate_grad_norm_group(grad_norm_group)
         if getattr(self, '_has_grad_norm_group_cache', None) is None:
@@ -1361,17 +1395,21 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     _validate_grad_norm_group(param_grad_norm_group)
                     local = local or param_grad_norm_group == grad_norm_group
             flag = torch.tensor([1 if local else 0], dtype=torch.int, device='cuda')
-            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX, group=None)
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MAX, group=self.grad_stats_parallel_group
+            )
             cache[grad_norm_group] = bool(flag.item() > 0)
         return cache[grad_norm_group]
 
     @torch.no_grad()
     def _get_grad_norm_for_group(self, grad_norm_group: str):
-        # similar to dist opt, always aggregate globally
+        # Aggregate across the module-local optimizer domain.
         grads_for_norm = []
         for optimizer in self.chained_optimizers:
             grads_for_norm += optimizer.get_grads_for_grad_norm(grad_norm_group)
-        grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
+        grad_norm = get_grad_norm_fp32(
+            grads_for_norm, grad_stats_parallel_group=self.grad_stats_parallel_group
+        )
         return grad_norm
 
     @torch.no_grad()
@@ -1381,10 +1419,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             params += optimizer.get_parameters()
         return count_zeros_fp32(
             params,
-            grad_stats_parallel_group=None,
+            grad_stats_parallel_group=self.grad_stats_parallel_group,
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             tp_group=self.tp_group,
             expert_tp_group=self.expert_tp_group,
+            gtp_group=self.gtp_group,
+            expert_gtp_group=self.expert_gtp_group,
         )
 
     def _managed_optimizer_state_offload_child_indices(self) -> tuple[int, ...]:
@@ -1470,7 +1510,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             )
         for sd in wrapped_state_dict.values():
             if 'fp32_from_fp16_params' in sd and isinstance(sd['fp32_from_fp16_params'], dict):
-                logger.info('[layerwise] converting fp32_from_fp16_params from dict to list')
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    '[layerwise] converting fp32_from_fp16_params from dict to list',
+                )
                 sd['fp32_from_fp16_params'] = [
                     v for k, v in sorted(sd['fp32_from_fp16_params'].items())
                 ]
@@ -1531,8 +1575,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 local_params = group.pop('params')
                 # save whether this group is empty, so we can use non-empty rank for metadata
                 group['params'] = bool(local_params.unwrap())
-                all_rank_groups = [None for _ in range(torch.distributed.get_world_size())]
-                torch.distributed.all_gather_object(all_rank_groups, group)
+                all_rank_groups = _all_gather_param_group_metadata(group, self.pg_collection)
                 # find first non-empty group if it exists
                 nonempty_rank_group = next((g for g in all_rank_groups if g['params']), group)
                 nonempty_rank_group['params'] = local_params

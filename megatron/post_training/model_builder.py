@@ -10,7 +10,6 @@ from typing import Any, ClassVar, Dict
 
 import modelopt.torch.distill as mtd
 import modelopt.torch.distill.plugins.megatron as mtd_mcore
-import modelopt.torch.opt as mto
 import yaml
 
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
@@ -28,29 +27,46 @@ from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_s
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.post_training.checkpointing import load_modelopt_state
-from megatron.post_training.utils import print_distributed_quant_summary
+from megatron.post_training.optimizer import install_lsq_optimizer_overrides
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.config import PretrainConfigContainer
+from megatron.training.global_vars import get_run_config
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 
 
 @dataclass(kw_only=True)
 class ModelOptModelConfig(GPTModelConfig):
-    """Config for the legacy ModelOpt model construction path."""
+    """Config for the legacy ModelOpt model construction path.
+
+    Identical to `GPTModelConfig` except for `builder` - construction still goes
+    through `gpt_config_from_args`, only the resolved builder class differs, since
+    ModelOpt-enabled runs need `ModelOptGPTModelBuilder` instead of `GPTModelBuilder`.
+    """
 
     builder: ClassVar[str] = "megatron.post_training.model_builder.ModelOptGPTModelBuilder"
 
 
 @dataclass(kw_only=True)
 class ModelOptHybridModelConfig(HybridModelConfig):
-    """Config for the legacy ModelOpt hybrid model construction path."""
+    """Config for the legacy ModelOpt model construction path, for hybrid models.
+
+    Identical to `HybridModelConfig` except for `builder` - construction still goes
+    through `hybrid_config_from_args`.
+    """
 
     builder: ClassVar[str] = "megatron.post_training.model_builder.ModelOptHybridModelBuilder"
 
 
 class _ModelOptBuilderMixin:
-    """Build a GPT or hybrid model through the legacy ModelOpt path."""
+    """Shared `build_model()` override for the legacy ModelOpt model construction path.
+
+    `modelopt_gpt_hybrid_builder` dispatches on `args.export_model_type` internally, so
+    the same implementation covers both GPT and hybrid models - only the parent
+    `ModelBuilder` (and its `build_distributed_models()`) differs per config type, so
+    each gets its own concrete class below rather than sharing one tied to `GPTModelBuilder`.
+    """
 
     def build_model(
         self,
@@ -59,21 +75,25 @@ class _ModelOptBuilderMixin:
         post_process: bool | None = None,
         vp_stage: int | None = None,
     ) -> MegatronModule:
+        args = get_args()
         if pre_process is None:
             pre_process = is_pp_first_stage(pg_collection.pp)
         if post_process is None:
             post_process = is_pp_last_stage(pg_collection.pp)
         return modelopt_gpt_hybrid_builder(
-            get_args(), pre_process, post_process, vp_stage, pg_collection=pg_collection
+            args, pre_process, post_process, vp_stage, pg_collection=pg_collection
         )
 
 
 class ModelOptGPTModelBuilder(_ModelOptBuilderMixin, GPTModelBuilder):
-    """Model builder adapter for the legacy ModelOpt GPT path."""
+    """ModelBuilder adapter for the legacy ModelOpt model construction path."""
 
 
 class ModelOptHybridModelBuilder(_ModelOptBuilderMixin, HybridModelBuilder):
-    """Model builder adapter for the legacy ModelOpt hybrid path."""
+    """ModelBuilder adapter for the legacy ModelOpt model construction path (hybrid)."""
+
+
+logger = logging.getLogger(__name__)
 
 
 def count_parameters_in_layer(model, layer_name):
@@ -96,69 +116,40 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     """Reads teacher config from a file.
 
     The config provided, either in the teacher checkpoint dir or via `--export-kd-teacher-model-config`,
-    should specify (in NeMo yaml config format) any model architecture settings which differ from the main student model's.
-    This function will translate NeMo field names to MCore as needed.
+    should specify any model architecture settings which differ from the main student model's.
+    The field names should match those returned by get_args() and not TransformerConfig.
     """
-    required_teacher_fields = (
-        "num_layers",
-        "hidden_size",
-        "ffn_hidden_size",
-        "num_attention_heads",
-    )
-
     args = get_args()
+
     if args.export_kd_teacher_model_config is not None:
         config_path = args.export_kd_teacher_model_config
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Teacher model-config file ({config_path}) not found.")
     else:
         config_path = os.path.join(checkpoint_path, "model_config.yaml")
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(
-            f"Teacher model-config file {config_path} not found.\n"
-            "Teacher checkpoint dir must contain a NeMo-format config named 'model_config.yaml'"
-            " or provide it via --export-kd-teacher-model-config."
-        )
-    with open(config_path) as f:
-        config = yaml.safe_load(f)
+        if not os.path.exists(config_path):
+            logger.warning(
+                "No teacher config provided via --export-kd-teacher-model-config nor found at"
+                f" {checkpoint_path}/model_config.yaml. Assuming teacher model architecture same as student's."
+            )  # Useful for cases like QAD
+            config_path = None
 
-    if missing_keys := [k for k in required_teacher_fields if k not in config]:
-        raise ValueError(
-            f"Teacher model config file ({config_path}) missing the following required fields: {missing_keys}"
-        )
+    args_dict = vars(args).copy()
 
-    if "encoder_seq_length" in config:
-        config["seq_length"] = config["encoder_seq_length"]
-    if "bias" in config:
-        config["disable_bias_linear"] = not config["bias"]
-    if config.get("activation") == "swiglu":
-        config["swiglu"] = True
-    if config.get("position_embedding_type", False) is None:
-        config["use_rotary_position_embeddings"] = config["no_position_embedding"] = True
-    if "share_embeddings_and_output_weights" in config:
-        config["untie_embeddings_and_output_weights"] = not config[
-            "share_embeddings_and_output_weights"
-        ]
-    if "tokenizer" in config:
-        config["tokenizer_type"] = config["tokenizer"]["type"]
-        config["tokenizer_model"] = config["tokenizer"]["model"]
-    if "masked_softmax_fusion" in config:
-        config["no_masked_softmax_fusion"] = not config["masked_softmax_fusion"]
-    if config.get("normalization") == "layernorm1p":
-        config["apply_layernorm_1p"] = True
-    if "precision" in config:
-        config[config["precision"]] = True
-    if "mcore_gpt" in config:
-        config["use_mcore_models"] = config["mcore_gpt"]
+    if config_path is not None:
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
 
-    args_dict = vars(get_args()).copy()
-    del args_dict["kv_channels"]  # not recalculated if present
-    # Setting teacher Flextron fields to false if training with Flextron, can be overridden
-    if "flextron" in args_dict:
-        config["flextron"] = False
-    if "enable_router" in args_dict:
-        config["enable_router"] = False
-    if "freeze_model" in args_dict:
-        config["freeze_model"] = False
-    args_dict.update(config)
+        del args_dict["kv_channels"]  # not recalculated if present
+        # Setting teacher Flextron fields to false if training with Flextron, can be overridden
+        if "flextron" in args_dict:
+            args_dict["flextron"] = False
+        if "enable_router" in args_dict:
+            args_dict["enable_router"] = False
+        if "freeze_model" in args_dict:
+            args_dict["freeze_model"] = False
+
+        args_dict.update(config)
 
     # Backward compat: old checkpoints have hybrid_override_pattern but not hybrid_layer_pattern
     if (
@@ -203,7 +194,7 @@ def _build_teacher_model(
 
     _add_load_convert_hooks(teacher)
 
-    # NOTE: Checkpoint loading now handled in `megatron/training/checkpointing.py`.
+    # NOTE: Checkpoint loading now handled by `megatron.post_training.checkpointing.load_kd_teacher_checkpoint()`.
 
     return teacher
 
@@ -267,6 +258,34 @@ def _freeze_for_qad(model, target):
 def _freeze_base_for_mtp(model):
     """Deprecated alias for ``_freeze_for_qad(model, "mtp")``."""
     _freeze_for_qad(model, "mtp")
+
+
+def _propagate_expert_allreduce_to_lsq_params(model):
+    """Copy each weight's MCore ``allreduce`` flag onto its LSQ ``_amax_{pre,post}`` params.
+
+    Without the flag, expert amax params get bucketed into the global data-parallel group
+    instead of the expert-data-parallel group (wrong grad reduction under expert parallelism).
+    """
+    module_by_name = dict(model.named_modules())
+    for name, param in model.named_parameters():
+        if not (name.endswith("_amax_pre") or name.endswith("_amax_post")):
+            continue
+        marker = ".weight_quantizer"
+        if marker not in name:
+            continue
+        linear = module_by_name.get(name.split(marker, 1)[0])
+        if linear is None:
+            continue
+        allreduce = next(
+            (
+                w.allreduce
+                for wname, w in linear.named_parameters(recurse=False)
+                if "weight" in wname and hasattr(w, "allreduce")
+            ),
+            None,
+        )
+        if allreduce is not None:
+            param.allreduce = allreduce
 
 
 def modelopt_gpt_hybrid_builder(
@@ -384,7 +403,10 @@ def modelopt_gpt_hybrid_builder(
             use_te = args.transformer_impl == "transformer_engine"
             decoder_layer_specs = get_gpt_decoder_layer_specs(config, use_transformer_engine=use_te)
             mtp_block_spec = get_gpt_mtp_block_spec(
-                config, decoder_layer_specs[-1], use_transformer_engine=use_te
+                config,
+                decoder_layer_specs[-1],
+                use_transformer_engine=use_te,
+                pp_rank=pg_collection.pp.rank() if pg_collection is not None else None,
             )
 
         model_kwargs = {
@@ -394,12 +416,14 @@ def modelopt_gpt_hybrid_builder(
             "pre_process": pre_process,
             "post_process": post_process,
             "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
+            "logit_dtype": getattr(args, "logit_dtype", None),
             "parallel_output": True,
             "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
             "position_embedding_type": args.position_embedding_type,
             "rotary_percent": args.rotary_percent,
             "rotary_base": args.rotary_base,
             "rope_scaling": args.use_rope_scaling,
+            "rope_scaling_factor": args.rope_scaling_factor,
             "mtp_block_spec": mtp_block_spec,
             "pg_collection": pg_collection,
         }
@@ -419,7 +443,7 @@ def modelopt_gpt_hybrid_builder(
             )
 
         if args.export_default_te_spec and args.export_te_mcore_model:
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "--export-default-te-spec and --export-te-mcore-model are mutually exclusive. "
                 "Since --export-default-te-spec is given, --export-te-mcore-model will be disabled."
             )
@@ -442,6 +466,7 @@ def modelopt_gpt_hybrid_builder(
             "pre_process": pre_process,
             "post_process": post_process,
             "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
+            "logit_dtype": getattr(args, "logit_dtype", None),
             "parallel_output": True,
             "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
             "position_embedding_type": args.position_embedding_type,
@@ -480,6 +505,12 @@ def modelopt_gpt_hybrid_builder(
     if qad_train_target is not None:
         _freeze_for_qad(model, qad_train_target)
 
+    # LSQ _amax_* params lack MCore's ``allreduce`` attribute; propagate it from each weight
+    # before get_model() builds DDP and the distributed optimizer. No-op without LSQ params.
+    _propagate_expert_allreduce_to_lsq_params(model)
+    if getattr(args, "lsq_scale_lr", None) is not None:
+        install_lsq_optimizer_overrides()
+
     _add_load_convert_hooks(model)
 
     # Distillation mode.
@@ -489,9 +520,11 @@ def modelopt_gpt_hybrid_builder(
         # NOTE: Unknown memory leak occuring per fwd-bwd pass if model
         # is converted to a `modelopt.torch.opt.DynamicModule`.
         # Argument `--manual-gc` can result in an eventual OOM.
-        assert (
-            not args.manual_gc
-        ), "ModelOpt Distillation currently incompatible with `--manual-gc` option."
+        cfg = get_run_config()
+        if isinstance(cfg, PretrainConfigContainer):
+            assert (
+                not cfg.train.manual_gc
+            ), "ModelOpt Distillation currently incompatible with `--manual-gc` option."
         assert (
             not args.tp_comm_overlap
         ), "ModelOpt Distillation currently incompatible with `--tp-comm-overlap` option."
@@ -521,12 +554,7 @@ def modelopt_gpt_hybrid_builder(
         # Additional tweaks needed for MCore.
         # (accounts for sharded state, pipeline parallel, and potentially skipping LM loss)
         mtd_mcore.adjust_distillation_model_for_mcore(model, distill_cfg)
-        # Also remove KD mode state to prevent issues with re-conversion after restore.
-        mto.ModeloptStateManager(
-            model
-        ).state_dict().pop()  # TODO(aanoosheh): remove once fixed in ModelOpt
 
-    print_distributed_quant_summary(model)
     return model
 
 

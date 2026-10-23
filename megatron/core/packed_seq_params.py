@@ -29,6 +29,9 @@ class PackedSeqParams:
     cu_seqlens_kv_padded: Tensor = None
     max_seqlen_q: int = None
     max_seqlen_kv: int = None
+    # Runtime dynamic context parallelism, set per microbatch by the packing scheduler.
+    # When local_cp_size is set, cp_group is the matching runtime group,
+    # including a singleton group when CP is disabled for this microbatch.
     local_cp_size: int = None
     cp_group: dist.ProcessGroup = None
     total_tokens: int = None
@@ -37,6 +40,7 @@ class PackedSeqParams:
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     tokens_per_sample: int = None
     cp_partition_route: Optional["ThdCpRoute"] = None
+    cp_scatter_cache: object = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.

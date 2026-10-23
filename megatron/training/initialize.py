@@ -35,6 +35,7 @@ from megatron.training import (
     inprocess_restart,
 )
 from megatron.training.async_utils import init_persistent_async_worker
+from megatron.training.global_vars import is_global_variables_initialized, set_global_variables
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,11 @@ def initialize_megatron(
         assert torch.cuda.is_available(), "Megatron requires CUDA."
 
     args = get_args()
+    # CLI parsing now registers inputs only. Construct services here, after the caller
+    # has prepared its config, while retaining compatibility with already initialized
+    # legacy entrypoints. This must precede all timer, tokenizer and microbatch use.
+    if not is_global_variables_initialized():
+        set_global_variables(args)
 
     # set logging level
     setup_logging()
@@ -354,6 +360,10 @@ def _initialize_distributed(
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
         inprocess_restart.maybe_force_nccl_backend_init(device_id)
+        if args.deterministic_mode:
+            from megatron.training.determinism import assert_nccl_algo_still_empty
+
+            assert_nccl_algo_still_empty()
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.

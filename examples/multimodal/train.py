@@ -1,13 +1,15 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain or SFT multimodal."""
+
 import math
 import os
 import sys
 from functools import partial
 
-from megatron.training.arguments import parse_and_validate_args
 import torch
 import yaml
+
+from megatron.training.arguments import parse_and_validate_args
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))

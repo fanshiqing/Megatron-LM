@@ -4,14 +4,12 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable, ClassVar, Literal
 
+import torch
 from typing_extensions import override
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
-from megatron.core.models.hybrid.hybrid_layer_specs import (
-    hybrid_stack_spec as default_hybrid_stack_spec,
-)
+from megatron.core.models.hybrid import hybrid_layer_specs
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
@@ -24,6 +22,10 @@ from megatron.training.models.dist_utils import unimodal_build_distributed_model
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
 logger = logging.getLogger(__name__)
+
+# Spec aliases are also used by builder overrides.
+hybrid_inference_stack_spec = hybrid_layer_specs.hybrid_inference_stack_spec
+default_hybrid_stack_spec = hybrid_layer_specs.hybrid_stack_spec
 
 
 @dataclass(kw_only=True)
@@ -48,6 +50,7 @@ class HybridModelConfig(ModelConfig):
     builder: ClassVar[str] = "megatron.training.models.hybrid.HybridModelBuilder"
     transformer: TransformerConfig
     fp16_lm_cross_entropy: bool = False
+    logit_dtype: torch.dtype | None = None
     parallel_output: bool = True
     share_embeddings_and_output_weights: bool = False
     hybrid_attention_ratio: float = 0.0
@@ -64,6 +67,9 @@ class HybridModelConfig(ModelConfig):
     hybrid_stack_spec: ModuleSpec | None = None
     vocab_size: int | None = None
     should_pad_vocab: bool = False
+
+    tp_comm_overlap_cfg: str | dict[str, Any] | None = None
+    """User-buffer settings, or their YAML path, when TP communication overlap is enabled."""
 
     @property
     def mamba_stack_spec(self):
@@ -110,6 +116,21 @@ class HybridModelConfig(ModelConfig):
             self.transformer.finalize()
 
 
+def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
+    """Return the configured stack spec, or the default one for the transformer config."""
+    if model_config.hybrid_stack_spec is not None:
+        return model_config.hybrid_stack_spec
+    if model_config.transformer.wide_residual is not None:
+        raise NotImplementedError(
+            "Upstream wide-residual stacks require migration of the retained dev hybrid layers."
+        )
+    if model_config.transformer.transformer_impl == "inference_optimized":
+        return hybrid_inference_stack_spec
+    if model_config.restore_modelopt_state:
+        return get_hybrid_stack_modelopt_spec(local_core_attention=False, remap_te_layernorm=False)
+    return default_hybrid_stack_spec
+
+
 class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
     """Builder to construct Megatron Core Hybrid models.
 
@@ -148,16 +169,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         Note:
             Virtual pipeline model parallelism is not supported for Hybrid models.
         """
-        hybrid_stack_spec = self._model_config.hybrid_stack_spec
-        if hybrid_stack_spec is None:
-            if self._model_config.transformer.transformer_impl == "inference_optimized":
-                hybrid_stack_spec = hybrid_inference_stack_spec
-            elif self._model_config.restore_modelopt_state:
-                hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
-                    local_core_attention=False, remap_te_layernorm=False
-                )
-            else:
-                hybrid_stack_spec = default_hybrid_stack_spec
+        hybrid_stack_spec = resolve_hybrid_stack_spec(self._model_config)
 
         assert (
             self._model_config.vocab_size is not None
@@ -184,6 +196,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             max_sequence_length=self._model_config.seq_length,
             hybrid_layer_pattern=self._model_config.hybrid_layer_pattern,
             fp16_lm_cross_entropy=self._model_config.fp16_lm_cross_entropy,
+            logit_dtype=self._model_config.logit_dtype,
             parallel_output=self._model_config.parallel_output,
             share_embeddings_and_output_weights=self._model_config.share_embeddings_and_output_weights,
             position_embedding_type=self._model_config.position_embedding_type,

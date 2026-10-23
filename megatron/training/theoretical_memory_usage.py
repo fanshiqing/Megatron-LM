@@ -2,7 +2,6 @@
 
 """Computes theoretical memory footprint for model training."""
 
-
 import math
 
 from .utils import is_hybrid_model, print_rank_0
@@ -307,7 +306,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
     return weight_and_optimizer_memory
 
 
-def compute_activation_memory(args, num_microbatches, verbose=False):
+def compute_activation_memory(args, num_microbatches, verbose=False, *, micro_batch_size):
     # Using formula in Table 2 of https://arxiv.org/pdf/2205.05198.pdf.
     # We are trying to compute the maximum activation footprint, so all calculations in this
     # function are for the first pipeline stage.
@@ -316,7 +315,7 @@ def compute_activation_memory(args, num_microbatches, verbose=False):
     # different from hidden_size.
 
     # Memory footprint from transformer layer (self-attention and MLP).
-    activation_memory = (args.seq_length * args.micro_batch_size * args.hidden_size) * (
+    activation_memory = (args.seq_length * micro_batch_size * args.hidden_size) * (
         18 + (4 * (args.ffn_hidden_size / args.hidden_size))
     )
     if verbose:
@@ -329,15 +328,10 @@ def compute_activation_memory(args, num_microbatches, verbose=False):
     # Now add activation memory required for input embeddings, last LayerNorm and output layer.
 
     # Input to embedding (pp_size microbatches in flight).
-    activation_memory += (
-        8 * args.seq_length * args.micro_batch_size * args.pipeline_model_parallel_size
-    )
+    activation_memory += 8 * args.seq_length * micro_batch_size * args.pipeline_model_parallel_size
     # Dropout in embedding layer (pp_size microbatches in flight).
     activation_memory += (
-        args.seq_length
-        * args.micro_batch_size
-        * args.hidden_size
-        * args.pipeline_model_parallel_size
+        args.seq_length * micro_batch_size * args.hidden_size * args.pipeline_model_parallel_size
     )
 
     # Multiply by interleaved PP memory factor.
@@ -371,7 +365,7 @@ def compute_activation_memory(args, num_microbatches, verbose=False):
         # Inputs to output layer and CE loss.
         activation_memory += (
             args.seq_length
-            * args.micro_batch_size
+            * micro_batch_size
             * args.hidden_size
             * 4
             * (1 + (args.padded_vocab_size / args.hidden_size))
@@ -381,13 +375,15 @@ def compute_activation_memory(args, num_microbatches, verbose=False):
     return activation_memory / args.tensor_model_parallel_size
 
 
-def compute_activation_memory_without_sp(args, num_microbatches, verbose=False):
+def compute_activation_memory_without_sp(
+    args, num_microbatches, verbose=False, *, micro_batch_size
+):
     """Compute activation memory without sequence parallelism"""
 
     # 4. Compute per-layer memory
     per_layer_memory = (
         args.seq_length
-        * args.micro_batch_size
+        * micro_batch_size
         * args.hidden_size
         * (10 + (24 / args.tensor_model_parallel_size))
     )
@@ -404,14 +400,11 @@ def compute_activation_memory_without_sp(args, num_microbatches, verbose=False):
     # 6. Add embedding activations
     # Input to embedding (pp_size microbatches in flight)
     total_activation_memory += (
-        8 * args.seq_length * args.micro_batch_size * args.pipeline_model_parallel_size
+        8 * args.seq_length * micro_batch_size * args.pipeline_model_parallel_size
     )
     # Dropout in embedding layer (pp_size microbatches in flight)
     total_activation_memory += (
-        args.seq_length
-        * args.micro_batch_size
-        * args.hidden_size
-        * args.pipeline_model_parallel_size
+        args.seq_length * micro_batch_size * args.hidden_size * args.pipeline_model_parallel_size
     )
 
     # 7. Handle pipeline parallelism schedules
@@ -444,12 +437,12 @@ def compute_activation_memory_without_sp(args, num_microbatches, verbose=False):
     # 8. Add output layer memory if needed
     if args.pipeline_model_parallel_size == 1:
         # Logits calculation
-        logits_size = args.seq_length * args.micro_batch_size * args.padded_vocab_size
+        logits_size = args.seq_length * micro_batch_size * args.padded_vocab_size
         # The output projection is partitioned across TP
         logits_size /= args.tensor_model_parallel_size
 
         # Outputs from final layer norm
-        final_ln_output = args.seq_length * args.micro_batch_size * args.hidden_size
+        final_ln_output = args.seq_length * micro_batch_size * args.hidden_size
 
         total_activation_memory += (logits_size + final_ln_output) * 2  # multiply by 2 for bytes
 
@@ -460,7 +453,7 @@ def compute_activation_memory_without_sp(args, num_microbatches, verbose=False):
     return total_activation_memory
 
 
-def report_theoretical_memory(args, num_microbatches=None, verbose=False):
+def report_theoretical_memory(args, num_microbatches=None, verbose=False, *, micro_batch_size):
     if is_hybrid_model(args):
         print(
             "Theoretical memory footprints not yet supported for hybrid Mamba-Transformer models."
@@ -475,14 +468,22 @@ def report_theoretical_memory(args, num_microbatches=None, verbose=False):
     if args.sequence_parallel and args.recompute_granularity == 'selective':
         print_rank_0("compute_activation_memory with SP")
         activation_memory = (
-            compute_activation_memory(args, num_microbatches=num_microbatches, verbose=verbose)
+            compute_activation_memory(
+                args,
+                num_microbatches=num_microbatches,
+                verbose=verbose,
+                micro_batch_size=micro_batch_size,
+            )
             / NUM_BYTES_IN_MEGABYTE
         )
     else:
         print_rank_0("compute_activation_memory_without_sp")
         activation_memory = (
             compute_activation_memory_without_sp(
-                args, num_microbatches=num_microbatches, verbose=verbose
+                args,
+                num_microbatches=num_microbatches,
+                verbose=verbose,
+                micro_batch_size=micro_batch_size,
             )
             / NUM_BYTES_IN_MEGABYTE
         )

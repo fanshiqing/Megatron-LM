@@ -8,6 +8,14 @@ from megatron.core.utils import get_tensor_model_parallel_group_if_none
 from tests.unit_tests.test_utilities import Utils
 
 
+class _FakeTPGroup:
+    def rank(self):
+        return 0
+
+    def size(self):
+        return 1
+
+
 @pytest.mark.internal
 def test_CopyToModelParallelRegion():
     Utils.initialize_model_parallel(4, 2)
@@ -78,6 +86,20 @@ def test_ScatterToModelParallelRegion():
         expected_output = expected_output + 4
     assert torch.equal(actual_output_data, expected_output)
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+def test_gather_from_model_parallel_region_tp1_allows_inplace_use():
+    input_leaf = torch.randn(2, 3, requires_grad=True)
+    input_data = input_leaf + 0
+
+    output_data = mappings.gather_from_tensor_model_parallel_region(
+        input_data, group=_FakeTPGroup()
+    )
+    output_data.add_(1)
+    output_data.sum().backward()
+
+    torch.testing.assert_close(input_leaf.grad, torch.ones_like(input_leaf))
 
 
 @pytest.mark.internal
@@ -170,13 +192,14 @@ def test_GatherFromSequenceParallelRegion():
 
 
 @pytest.mark.internal
-def test_AsyncGatherFromSequenceParallelRegion():
+@pytest.mark.parametrize("explicit_group", [False, True])
+def test_AsyncGatherFromSequenceParallelRegion(explicit_group):
     Utils.initialize_model_parallel(4, 1)
     group_rank = Utils.rank % 4
     input_data = (torch.ones((4, 2), device="cuda") * group_rank)[:, 0]
     input_data.requires_grad_(True)
     assert not input_data.is_contiguous()
-    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None)
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None) if explicit_group else None
 
     handle = mappings.async_gather_from_sequence_parallel_region(input_data, group=tp_group)
     assert handle._input_buffer is not None
@@ -202,12 +225,13 @@ def test_AsyncGatherFromSequenceParallelRegion():
 
 
 @pytest.mark.internal
-def test_AsyncReduceScatterAlongFirstDim():
+@pytest.mark.parametrize("explicit_group", [False, True])
+def test_AsyncReduceScatterAlongFirstDim(explicit_group):
     Utils.initialize_model_parallel(4, 1)
     group_rank = Utils.rank % 4
     input_data = (torch.ones((4, 16), device="cuda") * group_rank).t()
     assert not input_data.is_contiguous()
-    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None)
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None) if explicit_group else None
 
     handle = mappings.async_reduce_scatter_along_first_dim(input_data, group=tp_group)
     assert handle._input_buffer is not None
@@ -223,11 +247,12 @@ def test_AsyncReduceScatterAlongFirstDim():
 
 
 @pytest.mark.internal
-def test_AsyncSequenceParallelCollectivesGroupSizeOne():
+@pytest.mark.parametrize("explicit_group", [False, True])
+def test_AsyncSequenceParallelCollectivesGroupSizeOne(explicit_group):
     Utils.initialize_model_parallel(1, 1)
     input_data = torch.arange(8, dtype=torch.float32, device="cuda").reshape(4, 2)[:, 0]
     input_data.requires_grad_(True)
-    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None)
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None) if explicit_group else None
 
     gather_handle = mappings.async_gather_from_sequence_parallel_region(input_data, group=tp_group)
     reduce_scatter_handle = mappings.async_reduce_scatter_along_first_dim(

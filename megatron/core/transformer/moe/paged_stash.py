@@ -1228,6 +1228,12 @@ def paged_stash_reset(enabled=True, config=None):
     if stash_manager.status == 'begin':
         stash_manager.status = 'capture'
     elif stash_manager.status == 'capture':
+        # The first eager iteration records the stash sizes while using transient activations.
+        # Release its unused allocator cache before allocating the persistent stash, so both
+        # footprints do not inflate the warmup reservation. Never flush during graph capture.
+        if not torch.cuda.is_current_stream_capturing():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
         stash_manager.status = 'captured'
 
     if stash_manager.status == 'captured':

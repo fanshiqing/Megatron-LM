@@ -1477,6 +1477,97 @@ class TestGTPBufferReuse:
             dist.barrier()
             dist.destroy_process_group(group)
 
+    @pytest.mark.parametrize("role", ["fc1", "fc2"])
+    @pytest.mark.parametrize("graphness", ["graphed", "ungraphed"])
+    @pytest.mark.parametrize("num_layers", [1, 4])
+    def test_grouped_backward_reuses_tail_buffer(
+        self, monkeypatch, four_rank_gtp_group, role, graphness, num_layers
+    ):
+        """A grouped backward chain needs at most two buffers per local expert.
+
+        Copy each consumer's bytes before the next consume issues its prefetch. The oracle
+        catches overwriting an earlier consumer, while the pointer count catches an unpooled
+        tail. Graph replay numerics are additionally covered by test_gtp_grouped_cg.py.
+        """
+        cache = GTPWeightCache()
+        monkeypatch.setattr(gtp_module, "_GTP_CACHE", cache)
+        monkeypatch.setattr(gtp_module, "_GTP_GROUPED_BUF_PARITY_COUNTER", {})
+        monkeypatch.setattr(GTPShardedParam, "_link_tables_flushed", True)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "weight_prefetch", True)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "check_param_states", True)
+        group = four_rank_gtp_group
+        layers = []
+        for layer in range(num_layers):
+            weights = [
+                GTPShardedParam(torch.zeros(8, 16, dtype=torch.bfloat16, device="cuda"))
+                for _ in range(2)
+            ]
+            for expert, weight in enumerate(weights):
+                weight.group, weight.expert_idx = group, expert
+                weight.chain_id = f"GTP_remat_grouped_{role}_{graphness}"
+                weight.is_routed_expert = True
+                weight._debug_name = f"layers.{layer}.{role}.weight{expert}"
+                weight._double_buffer_parity()  # Assigned in forward order in training.
+            weights[0].weight_list = weights
+            layers.append(weights)
+        for previous, current in zip(layers, layers[1:]):
+            previous[0].next_w, current[0].prev_w = current[0], previous[0]
+
+        for step in range(3):
+            for layer, weights in enumerate(layers):
+                for expert, weight in enumerate(weights):
+                    weight.data.fill_(32 * step + 4 * layer + expert + group.rank())
+            copies = []
+            for layer in reversed(range(num_layers)):
+                values = layers[layer][0].all_gather_and_prefetch_bwd()
+                copies.append((layer, [value.clone() for value in values]))
+            for layer, values in copies:
+                for expert, value in enumerate(values):
+                    expected = torch.cat(
+                        [
+                            torch.full(
+                                (8, 16),
+                                32 * step + 4 * layer + expert + rank,
+                                dtype=torch.bfloat16,
+                                device="cuda",
+                            )
+                            for rank in range(group.size())
+                        ]
+                    )
+                    torch.testing.assert_close(value, expected, rtol=0, atol=0)
+            pointers = [
+                {cache.get(weights[expert]._ag_ticket_bwd).data_ptr() for weights in layers}
+                for expert in range(2)
+            ]
+            assert all(len(group_ptrs) == min(num_layers, 2) for group_ptrs in pointers)
+            assert pointers[0].isdisjoint(pointers[1])
+
+    @pytest.mark.parametrize(
+        "chain_id,has_ticket",
+        [
+            (GTPChain.UNGRAPHED.value, True),
+            (GTPChain.GRAPHED.value, True),
+            ("GTP_remat_grouped_fc1_ungraphed", False),
+        ],
+        ids=["dense-eager-tail", "dense-graphed-tail", "grouped-missing-ticket"],
+    )
+    def test_backward_tail_release_preserves_special_cases(self, monkeypatch, chain_id, has_ticket):
+        """Dense tails stay out of the pool; a missing backward ticket is not released."""
+        cache = GTPWeightCache()
+        monkeypatch.setattr(gtp_module, "_GTP_CACHE", cache)
+        monkeypatch.setattr(GTPShardedParam, "_link_tables_flushed", True)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "weight_prefetch", True)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "check_param_states", False)
+        weight = GTPShardedParam(torch.zeros(8, 16, dtype=torch.bfloat16, device="cuda"))
+        weight.group, weight.chain_id = _FakeGroup(), chain_id
+        if has_ticket:
+            weight._ag_ticket_bwd = cache.reserve(weight, weight.dtype, fwd=False)
+            cache.get(weight._ag_ticket_bwd)
+        # Model an on-demand consumer, including one that does not allocate a backward ticket.
+        monkeypatch.setattr(weight, "_all_gather_weight_on_demand", lambda fwd: weight)
+        assert weight.all_gather_and_prefetch_bwd() is weight
+        assert not any(cache._pool.values())
+
     @pytest.mark.parametrize("fwd", [True, False], ids=["forward", "backward"])
     @pytest.mark.parametrize("readiness", ["missing", "in_flight", "ready"])
     def test_peek_returns_ready_current_data(

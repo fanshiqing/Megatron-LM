@@ -1835,10 +1835,16 @@ class GTPShardedParam(torch.nn.Parameter):
             for w in self._weights:
                 w._set_state(GTPWeightState.NONE)
 
-        if GTP_CONFIG.weight_prefetch and self.next_w is not None:
+        if GTP_CONFIG.weight_prefetch and (
+            self.next_w is not None or _chain_is_grouped(self.chain_id)
+        ):
+            # Grouped chains alternate two gather buffers. Excluding the tail from the pool
+            # forces the next same-parity weight to allocate a third buffer. Preserve the
+            # existing non-grouped tail policy; release keeps each ticket's address stable.
             cache = get_global_GTP_cache()
             for w in self._weights:
-                cache.release(w._ag_ticket_bwd)
+                if w._ag_ticket_bwd is not None:
+                    cache.release(w._ag_ticket_bwd)
 
         return result
 

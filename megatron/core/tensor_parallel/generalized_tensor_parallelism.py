@@ -2931,12 +2931,20 @@ class GTPWeightCache:
     def release(self, ticket: int):
         """Release a reusable buffer to the pool while keeping its ticket valid.
 
-        Captured reduce-scatter tickets keep exclusive ownership. ``slot.buf`` is never cleared,
-        so every CUDA-graph ticket retains a stable address across replays.
+        Eager/full-iteration RS outputs are released after main-gradient accumulation.
+        Captured partial-graph RS tickets retain exclusive ownership across replays.
+        AG release is deferred until its consumer has queued all reads.
         """
         slot = self._slots[ticket]
         if self.uses_allocator_lifetimes() and not slot.reduce_scatter:
             # The caller has not queued its GEMM yet. Release at the next consumer.
+            return
+        if self.uses_allocator_lifetimes() and slot.reduce_scatter:
+            if slot.buf is not None:
+                # main_grad accumulation is queued on this stream after RS completion.
+                slot.buf.record_stream(torch.cuda.current_stream())
+                slot.buf.untyped_storage().resize_(0)
+                slot.buf = None
             return
         if slot.buf is None:
             return

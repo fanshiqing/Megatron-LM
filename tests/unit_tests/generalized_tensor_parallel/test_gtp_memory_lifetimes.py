@@ -83,3 +83,27 @@ def test_partial_graphs_keep_existing_buffer_policy(monkeypatch):
     cache.release(0)
     assert slot.buf is buffer and cache._pool[slot.key][0] is buffer
     assert not cache._last_ag_consumer
+
+
+@pytest.mark.parametrize("captured", [False, True])
+def test_rs_release_preserves_queued_accumulation(captured):
+    result = torch.zeros((), device="cuda")
+    cache, slot, _ = make_slot(reduce_scatter=True)
+
+    def accumulate():
+        buffer = torch.full((1024,), 3.0, device="cuda")
+        slot.buf = buffer
+        result.copy_(buffer.sum())
+        cache.release(0)
+        assert slot.buf is None and buffer.untyped_storage().nbytes() == 0
+        torch.empty_like(buffer).fill_(-100)
+
+    accumulate()
+    if captured:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            accumulate()
+        for _ in range(3):
+            graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(result, torch.tensor(3072.0, device="cuda"))

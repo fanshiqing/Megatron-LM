@@ -1857,13 +1857,16 @@ class GTPShardedParam(torch.nn.Parameter):
         """Backward variant: get the current weight (cached if prefetched, else sync gather)
         and async-prefetch prev_w.
 
-        Safe via the coat-check cache: get() returns the current buffer to the pool, and the
-        prefetch's checkout allocates a separate buffer if the pool is empty (current buffer
-        still live via the caller's reference).
+        Current storage remains live until its consumer has queued its reads. Eager/full-
+        iteration execution releases it at a later consumer; partial graphs retain their
+        explicit cache ownership.
 
         Returns:
             weight_total
         """
+        cache = get_global_GTP_cache()
+        cache.begin_ag_consume(self, "bwd")
+
         # Links are only created during forward, so every chain is complete by the first
         # backward all-gather. Logging here rather than at the end of the iteration means the
         # tables are still emitted if backward then fails, which is when they are most useful.
@@ -1906,6 +1909,7 @@ class GTPShardedParam(torch.nn.Parameter):
                 if w._ag_ticket_bwd is not None:
                     cache.release(w._ag_ticket_bwd)
 
+        cache.end_ag_consume(self, "bwd")
         return result
 
     def batched_all_gather_and_prefetch_bwd(self, nvtx_label=None):
@@ -1924,6 +1928,9 @@ class GTPShardedParam(torch.nn.Parameter):
         # (see __init__) instead of the fwd/bwd chains; lazy-built below.
         in_recompute = in_activation_recompute_phase()
         use_recompute_chain = in_recompute and GTP_CONFIG.weight_prefetch
+        cache = get_global_GTP_cache()
+        cache_phase = "recompute" if in_recompute else "fwd"
+        cache.begin_ag_consume(self, cache_phase)
 
         # Reaching a forward gather proves the previous backward finished, so the chains it
         # built are complete. Mirrors flush_link_tables, which fires on the first backward AG.
@@ -2029,13 +2036,19 @@ class GTPShardedParam(torch.nn.Parameter):
                 )
 
             for w, dt in zip(self._weights, dtypes):
-                w._ag_ticket_fwd = cache.reserve(w, dt, fwd=True)
-                cache.get(w._ag_ticket_fwd)
-                cache.release(w._ag_ticket_fwd)
+                if cache.uses_allocator_lifetimes():
+                    # On-demand gathering may already have reserved this exclusive slot.
+                    if w._ag_ticket_fwd is None:
+                        w._ag_ticket_fwd = cache.reserve(w, dt, fwd=True)
+                else:
+                    w._ag_ticket_fwd = cache.reserve(w, dt, fwd=True)
+                    cache.get(w._ag_ticket_fwd)
+                    cache.release(w._ag_ticket_fwd)
 
             self.prefetch_initialized = True
             chain["last_weight"] = self
 
+        cache.end_ag_consume(self, cache_phase)
         return result
 
     def batched_all_gather_and_prefetch(self, **kwargs):
@@ -2715,8 +2728,11 @@ class GTPWeightCache:
 
     - reserve(param, dtype, fwd) → ticket: assign a persistent ticket (no buffer yet).
     - get(ticket) → buffer: return the buffer, lazily (re)allocating from pool or fresh.
-    - release(ticket): return the buffer to the pool; ticket stays valid.
+    - release(ticket): apply the storage lifetime policy; the ticket stays valid.
     - clear(): drop all buffers/pools; tickets stay valid, next get() allocates fresh.
+
+    Eager/full-iteration consumers return completed AG storage to the allocator.
+    Independently replayed partial graphs retain explicit cache ownership.
     """
 
     # Bytes per element for known dtypes (for logging). Add entries when GTP caches buffers of
@@ -2737,6 +2753,72 @@ class GTPWeightCache:
         self._next_ticket: int = 0
         self._total_bytes: int = 0  # running total of allocated bytes
         self.key_to_allocate_func = {}
+        self._last_ag_consumer = {}
+
+    @staticmethod
+    def uses_allocator_lifetimes():
+        """Use stream-ordered storage release in eager and full-iteration graphs.
+
+        Keep the existing cache policy for independently replayed partial graphs.
+        """
+        return _FULL_ITERATION or _CUDA_GRAPH_MODULES is None
+
+    def begin_ag_consume(self, param, phase):
+        """Release completed AG storage within one chain, phase and consumer stream.
+
+        The previous consumer has queued its reads before entering this consumer. Native
+        allocator stream order protects those reads. Recompute has a separate lifetime
+        domain because it can run before a pending dgrad consumes its materialization.
+        """
+        if not self.uses_allocator_lifetimes():
+            return
+        key = (param.chain_id, id(param.group), phase, torch.cuda.current_stream().cuda_stream)
+        pending = self._last_ag_consumer.pop(key, [])
+        for ticket, old_buffer in pending:
+            slot = self._slots[ticket]
+            # Never discard a newer prefetched materialization of a repeated consumer.
+            if slot.buf is not old_buffer:
+                continue
+            if slot.param._prefetch_handle is not None or getattr(
+                slot.param, "_already_ag_drained", False
+            ):
+                self._last_ag_consumer.setdefault(key, []).append((ticket, old_buffer))
+                continue
+            if isinstance(old_buffer, QuantizedTensor):
+                tensors = [
+                    getattr(old_buffer, attr, None)
+                    for attr in (
+                        "_rowwise_data",
+                        "_columnwise_data",
+                        "_rowwise_scale_inv",
+                        "_columnwise_scale_inv",
+                    )
+                ]
+            else:
+                tensors = [old_buffer]
+            storages = {}
+            for tensor in tensors:
+                if tensor is not None:
+                    storage = tensor.untyped_storage()
+                    storages[storage.data_ptr()] = storage
+            for storage in storages.values():
+                storage.resize_(0)
+            slot.buf = None
+
+    def end_ag_consume(self, param, phase):
+        if not self.uses_allocator_lifetimes():
+            return
+        key = (param.chain_id, id(param.group), phase, torch.cuda.current_stream().cuda_stream)
+        attr = {
+            "fwd": "_ag_ticket_fwd",
+            "bwd": "_ag_ticket_bwd",
+            "recompute": "_ag_ticket_recompute",
+        }[phase]
+        pending = self._last_ag_consumer.setdefault(key, [])
+        for weight in param._weights:
+            ticket = getattr(weight, attr)
+            if ticket is not None and self._slots[ticket].buf is not None:
+                pending.append((ticket, self._slots[ticket].buf))
 
     @staticmethod
     def _buf_bytes(shape, dtype) -> int:
@@ -2824,7 +2906,12 @@ class GTPWeightCache:
         """Return the buffer for *ticket*, lazily allocating if needed."""
         slot = self._slots[ticket]
         if slot.buf is None:
-            pool = self._pool[slot.key]
+            # AG views stay exclusive until their consumer lifetime ends.
+            pool = (
+                []
+                if self.uses_allocator_lifetimes() and not slot.reduce_scatter
+                else self._pool[slot.key]
+            )
             slot.buf = (
                 pool.pop()
                 if pool
@@ -2848,6 +2935,9 @@ class GTPWeightCache:
         so every CUDA-graph ticket retains a stable address across replays.
         """
         slot = self._slots[ticket]
+        if self.uses_allocator_lifetimes() and not slot.reduce_scatter:
+            # The caller has not queued its GEMM yet. Release at the next consumer.
+            return
         if slot.buf is None:
             return
         # Independently replayed graphs may overlap, so a captured RS output must not be recycled
@@ -2864,6 +2954,7 @@ class GTPWeightCache:
         for slot in self._slots.values():
             slot.buf = None
         self._pool.clear()
+        self._last_ag_consumer.clear()
         self._total_bytes = 0
 
 

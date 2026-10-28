@@ -10,6 +10,7 @@ from typing import Optional
 import torch
 
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.tensor_parallel.generalized_tensor_parallelism import get_global_GTP_cache
 from megatron.core.tensor_parallel.gtp_symmetric_memory import symmetric_wgrad_pool
 from megatron.core.tensor_parallel.random import (
     cudagraph_needs_generator_registration,
@@ -339,6 +340,8 @@ class FullCudaGraphWrapper:
             # coexist for the lifetime of the graph, and warmup fragmentation
             # (reserved-but-unallocated blocks) otherwise counts against the
             # capture's headroom.
+            torch.cuda.synchronize()
+            get_global_GTP_cache().prepare_full_graph_capture()
             gc.collect()
             torch.cuda.empty_cache()
             assert FullCudaGraphWrapper.cuda_graph[training_str] is None

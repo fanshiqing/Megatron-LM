@@ -2755,6 +2755,30 @@ class GTPWeightCache:
         self.key_to_allocate_func = {}
         self._last_ag_consumer = {}
 
+    def prepare_full_graph_capture(self):
+        """Drop completed eager storage before full-iteration capture.
+
+        Called at a synchronized full-iteration boundary, before entering capture.
+        Partial graphs and cross-capture prefetch handoffs are not supported here.
+        """
+        if not self._slots:
+            return
+        if not _FULL_ITERATION:
+            raise RuntimeError("Warmup buffer reset requires full-iteration capture")
+        # Validate every owner before changing any reference: a failed precondition
+        # must not leave half of the cache cleared. The caller has synchronized CUDA.
+        for slot in self._slots.values():
+            param = slot.param
+            assert getattr(param, "_wgrad_rs_handle", None) is None
+            assert param._prefetch_handle is None
+            assert not getattr(param, "_already_ag_drained", False)
+            assert getattr(param, "_recompute_prefetch_handle", None) is None
+            assert not getattr(param, "_recompute_already_drained", False)
+        for slot in self._slots.values():
+            slot.buf = None
+        self._pool.clear()
+        self._last_ag_consumer.clear()
+
     @staticmethod
     def uses_allocator_lifetimes():
         """Use stream-ordered storage release in eager and full-iteration graphs.
@@ -2849,7 +2873,9 @@ class GTPWeightCache:
         if not reduce_scatter and is_gtp_symm_pool_registered(param.group, mode="ag"):
             alloc_ctx = gtp_symm_pool_ctx(param.group)
         else:
-            alloc_ctx = cuda_graph_pool_allocation(_chain_is_graphed(chain_id))
+            alloc_ctx = cuda_graph_pool_allocation(
+                _chain_is_graphed(chain_id) and not torch.cuda.is_current_stream_capturing()
+            )
         with alloc_ctx:
             if not isinstance(dtype, torch.dtype):
                 # Use the gather quantizer copy: mutating the param's own quantizer usage

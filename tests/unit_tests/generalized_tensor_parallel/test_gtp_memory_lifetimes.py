@@ -107,3 +107,39 @@ def test_rs_release_preserves_queued_accumulation(captured):
             graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(result, torch.tensor(3072.0, device="cuda"))
+
+
+@pytest.mark.parametrize(
+    "pending",
+    [
+        "_wgrad_rs_handle",
+        "_prefetch_handle",
+        "_already_ag_drained",
+        "_recompute_prefetch_handle",
+        "_recompute_already_drained",
+    ],
+)
+def test_capture_reset_rejects_pending_work_atomically(pending):
+    cache, first, _ = make_slot(object())
+    _, second, param = make_slot(object())
+    cache._slots[1] = second
+    before = [first.buf, second.buf]
+    setattr(param, pending, True)
+    cache._pool["sentinel"] = [object()]
+    with pytest.raises(AssertionError):
+        cache.prepare_full_graph_capture()
+    assert first.buf is before[0] and second.buf is before[1]
+    assert cache._pool["sentinel"]
+
+
+def test_capture_reset_clears_completed_references(monkeypatch):
+    cache, slot, _ = make_slot(object())
+    cache._pool["sentinel"] = [object()]
+    cache._last_ag_consumer["sentinel"] = object()
+    monkeypatch.setattr(gtp, "_FULL_ITERATION", False)
+    with pytest.raises(RuntimeError):
+        cache.prepare_full_graph_capture()
+    assert slot.buf is not None
+    monkeypatch.setattr(gtp, "_FULL_ITERATION", True)
+    cache.prepare_full_graph_capture()
+    assert slot.buf is None and not cache._pool and not cache._last_ag_consumer

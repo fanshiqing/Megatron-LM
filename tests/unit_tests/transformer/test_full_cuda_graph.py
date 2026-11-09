@@ -275,3 +275,69 @@ def test_forward_backward_func_with_full_cuda_graph(mocker):
         print(losses_reduced)
         assert i['loss_reduced'] == j['loss_reduced']
     Utils.destroy_model_parallel()
+
+
+def test_static_loader_preserves_captured_storage_after_consumer_mutation():
+    """Pipeline batch pruning must not replace the loader's captured tensor storage."""
+    loader = StaticBufferLoader()
+    batch = loader(
+        {
+            'tokens': torch.ones(2, 3),
+            'labels': torch.full((2, 3), 2.0),
+            'nested': [torch.full((2, 3), 3.0)],
+        },
+        'training',
+        0,
+    )
+    pointers = [
+        batch['tokens'].data_ptr(),
+        batch['labels'].data_ptr(),
+        batch['nested'][0].data_ptr(),
+    ]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = batch['tokens'] + batch['labels'] + batch['nested'][0]
+    # get_batch masks fields in place according to the pipeline stage.
+    batch['tokens'] = None
+    batch['labels'] = None
+    batch['nested'][0] = None
+    updated = loader(
+        {
+            'tokens': torch.full((2, 3), 4.0),
+            'labels': torch.full((2, 3), 5.0),
+            'nested': [torch.full((2, 3), 6.0)],
+        },
+        'training',
+        0,
+    )
+    assert pointers == [
+        updated['tokens'].data_ptr(),
+        updated['labels'].data_ptr(),
+        updated['nested'][0].data_ptr(),
+    ]
+    graph.replay()
+    torch.testing.assert_close(output, torch.full_like(output, 15), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('leading_empty_chunk', [False, True])
+def test_vpp_static_inputs_have_independent_storage(leading_empty_chunk):
+    """A graph must read the batch belonging to each virtual chunk and microbatch."""
+    wrapper = FullCudaGraphWrapper(lambda **_: None)
+
+    def iterators(offset):
+        active = [
+            iter([{'tokens': torch.full((2, 3), float(offset + i))} for i in pair])
+            for pair in [(1, 2), (3, 4)]
+        ]
+        return [None, *active] if leading_empty_chunk else [*active, None]
+
+    first = wrapper.data_read(iterators(0), [object()] * 3, True, 2)
+    tensors = [
+        next(iterator)['tokens'] for iterator in first if iterator is not None for _ in range(2)
+    ]
+    assert len({tensor.data_ptr() for tensor in tensors}) == 4
+    for tensor, expected in zip(tensors, [1, 2, 3, 4]):
+        torch.testing.assert_close(tensor, torch.full_like(tensor, expected), rtol=0, atol=0)
+    wrapper.data_read(iterators(10), [object()] * 3, True, 2)
+    for tensor, expected in zip(tensors, [11, 12, 13, 14]):
+        torch.testing.assert_close(tensor, torch.full_like(tensor, expected), rtol=0, atol=0)

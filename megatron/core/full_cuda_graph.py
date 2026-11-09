@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterable, Sequence
 from typing import Optional
 
 import torch
+from torch.utils._pytree import tree_map
 
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tensor_parallel.gtp_symmetric_memory import symmetric_wgrad_pool
@@ -231,7 +232,9 @@ class StaticBufferLoader:
                     StaticBufferLoader.static_buffers[stage][microbatch], inputs
                 )
         torch.cuda.current_stream().wait_stream(self.stream)
-        return StaticBufferLoader.static_buffers[stage][microbatch]
+        # Batch consumers prune fields for their pipeline stage. Give them independent
+        # containers while retaining the tensor storage referenced by captured graphs.
+        return tree_map(lambda value: value, StaticBufferLoader.static_buffers[stage][microbatch])
 
 
 class FullCudaGraphWrapper:
@@ -266,15 +269,19 @@ class FullCudaGraphWrapper:
         else:
             assert isinstance(data_iterator, list) and len(data_iterator) == len(model)
             data_list = []
+            buffer_index = 0
             for i in range(len(model)):
                 if data_iterator[i] is not None:
                     data_list_i = []
-                    for b in range(num_microbatches):
+                    for _ in range(num_microbatches):
                         data_list_i.append(
                             self.static_loader(
-                                next(data_iterator[i]), 'training' if training else 'validation', b
+                                next(data_iterator[i]),
+                                'training' if training else 'validation',
+                                buffer_index,
                             )
                         )
+                        buffer_index += 1
                     data_list.append(iter(data_list_i))
                 else:
                     data_list.append(None)

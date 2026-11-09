@@ -462,6 +462,64 @@ def test_start_param_sync_dp_size_1():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize('disable_bucketing', [False, True])
+@pytest.mark.parametrize('fp32_accumulation', [False, True])
+def test_vpp_mixed_dtype_gradient_reductions(disable_bucketing, fp32_accumulation, monkeypatch):
+    """Later VPP chunks must finish reductions for every gradient dtype."""
+    # DDP selects the FP32-accumulating implementation through a module global.
+    monkeypatch.setattr(
+        'megatron.core.distributed.param_and_grad_buffer.dist_reduce_scatter_func',
+        torch.distributed.reduce_scatter_tensor,
+    )
+    Utils.initialize_model_parallel()
+    try:
+        group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        module = torch.nn.ParameterList(
+            [
+                torch.nn.Parameter(torch.ones(16, 16, device='cuda', dtype=dtype))
+                for dtype in (torch.bfloat16, torch.float32)
+            ]
+        )
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=False,
+            use_distributed_optimizer=True,
+            overlap_grad_reduce=True,
+            reduce_scatter_with_fp32_accumulation=fp32_accumulation,
+        )
+        layout = DistributedOptimizer.compute_full_param_layout(
+            list(module.parameters()), None, group.size(), ddp_config
+        )
+        model = DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            ddp_config=ddp_config,
+            module=module,
+            disable_bucketing=disable_bucketing,
+            full_param_layout=layout,
+        )
+        assert len(model.buffers) == 2
+        if fp32_accumulation:
+            assert all(len(bucket_group.buckets) == 1 for bucket_group in model.bucket_groups)
+
+        for step in range(3):
+            model.zero_grad_buffer()
+            local_gradient = group.rank() + step + 1
+            sum(param.float().sum() * local_gradient for param in module).backward()
+            model.finish_grad_sync()
+            torch.cuda.synchronize()
+            expected_gradient = (group.size() + 1) / 2 + step
+            for buffer in model.buffers:
+                for bucket in buffer.buckets:
+                    reduced_shard = bucket.grad_data.chunk(group.size())[group.rank()]
+                    torch.testing.assert_close(
+                        reduced_shard,
+                        torch.full_like(reduced_shard, expected_gradient),
+                        atol=0,
+                        rtol=0,
+                    )
+    finally:
+        Utils.destroy_model_parallel()
+
+
 class TestFreeOverlapBuffers:
     """Tests for free_overlap_buffers() which releases GPU memory before async checkpoint saves."""
 

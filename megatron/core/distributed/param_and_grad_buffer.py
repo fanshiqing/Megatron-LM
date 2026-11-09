@@ -1934,8 +1934,9 @@ def partition_buckets(
             assert fp8_buffer is None
             fp8_buffer = buffer
 
-    # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.
-    if force_single_bucket_group:
+    # FP32-accumulating async reduce-scatter tracks one completion handle per group.
+    # Keep singleton groups even when later VPP chunks disable bucketing.
+    if force_single_bucket_group and not reduce_scatter_with_fp32_accumulation:
         buckets = []
         ddp_config = buffers[0].ddp_config
         data_parallel_group = buffers[0].data_parallel_group

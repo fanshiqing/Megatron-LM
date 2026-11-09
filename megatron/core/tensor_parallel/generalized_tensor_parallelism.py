@@ -663,7 +663,11 @@ def tag_gtp_params_with_names(model):
     """
     # Off under a stepped batch schedule: a rising consume count double-fires grad-ready and
     # drops a contribution (see _is_last_expected_consume).
-    accum_ok = not _num_microbatches_can_change()
+    # Pipeline schedules can dispatch a chunk's DP gradient sync before the global GTP
+    # fence flushes deferred output-head wgrads. Until that flush is chunk-aware, reduce
+    # each consume before handing its gradient to the pipeline's sync boundary.
+    pipeline_size = getattr(getattr(model, "config", None), "pipeline_model_parallel_size", 1)
+    accum_ok = not _num_microbatches_can_change() and pipeline_size == 1
     for name, param in model.named_parameters():
         if is_gtp_param(param):
             param._debug_name = name
